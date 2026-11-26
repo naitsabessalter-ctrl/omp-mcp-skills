@@ -12,7 +12,8 @@ const root = "mcp://fixture/";
 const description = (name) => `Deterministic ${name} smoke fixture`;
 const uriFor = (name) => `${root}${name}/SKILL.md`;
 const document = (name, revision = 1) =>
-  `---\nname: ${name}\ndescription: ${description(name)}\n---\n\nFIXTURE_BODY_${name}_REV_${revision}\n`;
+  `---\nname: ${name}\ndescription: ${description(name)}\n---\n\nFIXTURE_BODY_${name}_REV_${revision}\nSee [the nested reference](refs/guide.md).\n`;
+const reference = (name) => `NESTED_REFERENCE_${name}\n`;
 const digest = (text) => `sha256:${createHash("sha256").update(text).digest("hex")}`;
 const resource = (uri, text) => ({ uri, digest: digest(text), size: Buffer.byteLength(text) });
 const manifest = (name, revision = 1) => ({
@@ -21,6 +22,7 @@ const manifest = (name, revision = 1) => ({
   resources: [
     resource(uriFor(name), document(name, revision)),
     resource(`${root}${name}/notes.txt`, `Notes for ${name}\n`),
+    resource(`${root}${name}/refs/guide.md`, reference(name)),
   ],
 });
 const cache = { resultType: "complete", ttlMs: 60_000, cacheScope: "private" };
@@ -90,6 +92,8 @@ function handle(method, params) {
         if (name === "bad-digest") text += "TAMPERED_BYTES_MUST_NEVER_BE_PRESENTED\n";
       } else if (params.uri === `${root}${name}/notes.txt`) {
         text = `Notes for ${name}\n`;
+      } else if (params.uri === `${root}${name}/refs/guide.md`) {
+        text = reference(name);
       } else {
         fail(-32602, "Resource is not in the skill manifest");
       }

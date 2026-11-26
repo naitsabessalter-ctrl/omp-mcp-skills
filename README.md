@@ -12,11 +12,9 @@ Start a new OMP session. Configure the MCP server in OMP as usual; the plugin ha
 
 ## Use
 
-Describe your task normally. The agent sees the server-scoped catalog from its first prompt and can load a matching skill on demand. The plugin registers no slash commands. Remote skills are not installed in `omp skill list` or `/skill:`. The agent can also load an unlisted skill if given its URI. Reading a supporting file does not activate a skill.
+Describe your task normally. OMP sees the server catalog before the model answers and uses its **built-in `read` tool** for the skill and its supporting files. The plugin registers a read-only `mcp-skill://` URI scheme, not a model tool or slash command. No skill loader, approval flag or plugin confirmation dialog is involved. Local `skill://` resolution stays unchanged.
 
-**Approvals.** Model-initiated loads require interactive confirmation by default. With no UI the default is to refuse them. For explicitly trusted unattended automation, `OMP_MCP_SKILLS_APPROVALS=tool` accepts `approve: true` from a tool call instead of asking the user. This trusts the caller, including a model, and is **not** human approval. In that mode `mcp_skills_allow_exec` grants execution for the session. In UI mode an active skill causes an additional confirmation for `bash`, `shell`, `exec`, `python`, and `eval`. This is not a sandbox for arbitrary third-party tools. Remote `allowed-tools` does not grant permissions.
-
-Manifest-backed files are checked against the server-provided byte size and SHA-256 digest. A digest establishes consistency, not trust in the server. Dynamic skills have no digest and require approval on every load. The loaded text identifies its origin; caches and approvals are not written to disk.
+Enabling an MCP server means its skills can be read automatically. Treat them as third-party instructions, even when integrity checks pass. Manifest-backed files are checked against the listed byte length and SHA-256 digest; dynamic skills have no content digest. The plugin does not execute skill files, grant shell access, change OMP's own tool approvals or persist the remote skills as installed files.
 
 ## Integration
 

@@ -75,13 +75,10 @@ export function utf8(text: string): Uint8Array {
 
 /** Skill path with no scheme and no `/SKILL.md` suffix. The first segment is an authority, not a host. */
 export function skillPath(uri: string): string | undefined {
-  if (!uri.endsWith("/SKILL.md")) return undefined;
+  if (!uri.endsWith("/SKILL.md") || !/^[a-z][a-z0-9+.-]*:\/\//i.test(uri)) return undefined;
   const marker = uri.indexOf("://");
-  if (marker < 1) return undefined;
   const path = uri.slice(marker + 3, -"/SKILL.md".length);
-  if (path.length === 0 || path.endsWith("/") || path.split("/").some((part) => part.length === 0 || part === "." || part === "..")) {
-    return undefined;
-  }
+  if (path.length === 0 || path.split("/").some((part) => !safeUriSegment(part))) return undefined;
   return path;
 }
 
@@ -131,32 +128,38 @@ function stable(value: unknown): string {
 
 export function isWithinSkill(skillMdUri: string, fileUri: string): boolean {
   const root = skillRoot(skillMdUri);
-  if (root === undefined) return false;
-  if (fileUri === skillMdUri) return true;
-  const prefix = `${root}/`;
-  if (!fileUri.startsWith(prefix)) return false;
-  const rest = fileUri.slice(prefix.length);
-  if (rest.length === 0 || rest.endsWith("/")) return false;
-  return rest.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
+  if (root === undefined || !fileUri.startsWith(`${root}/`)) return false;
+  return fileUri.slice(root.length + 1).split("/").every(safeUriSegment);
 }
 
-/** Resolve a relative reference against the skill root. Absolute URIs pass through. `..` may not escape the root. */
+function safeUriSegment(segment: string): boolean {
+  if (segment.length === 0 || /[\\?#\0]/.test(segment)) return false;
+  try {
+    const decoded = decodeURIComponent(segment);
+    return decoded !== "." && decoded !== ".." && !/[\/\\?#\0]/.test(decoded);
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve an escaped resource path without allowing another origin or root traversal. */
 export function resolveReference(skillMdUri: string, reference: string): string | undefined {
-  if (reference.includes("://")) return reference;
   const root = skillRoot(skillMdUri);
   if (root === undefined) return undefined;
+  if (reference.includes("://")) return isWithinSkill(skillMdUri, reference) ? reference : undefined;
+  if (reference.startsWith("/") || /[\\?#\0]/.test(reference)) return undefined;
   const parts: string[] = [];
   for (const part of reference.split("/")) {
     if (part === "" || part === ".") continue;
     if (part === "..") {
       if (parts.length === 0) return undefined;
       parts.pop();
-      continue;
+    } else {
+      if (!safeUriSegment(part)) return undefined;
+      parts.push(part);
     }
-    parts.push(part);
   }
-  if (parts.length === 0) return undefined;
-  return `${root}/${parts.join("/")}`;
+  return parts.length === 0 ? undefined : `${root}/${parts.join("/")}`;
 }
 
 export interface ParsedFrontmatter {
@@ -417,29 +420,32 @@ export function clientCapabilitiesWithSkills(capabilities: Record<string, unknow
 
 export function decodeResource(contents: unknown, uri: string): { bytes: Uint8Array; text?: string; mimeType?: string } | { error: string } {
   if (!isRecord(contents) || !Array.isArray(contents.contents)) return { error: "resources/read result needs contents" };
-  const items = contents.contents.filter((item) => isRecord(item));
-  const match = items.find((item) => item.uri === uri);
-  if (!match) return { error: `resources/read returned no contents for ${uri}` };
+  const matches = contents.contents.filter((item) => isRecord(item) && item.uri === uri);
+  const match = matches[0];
+  if (!isRecord(match)) return { error: `resources/read returned no contents for ${uri}` };
+  if (matches.length !== 1) return { error: `resources/read returned duplicate contents for ${uri}` };
   const mimeType = typeof match.mimeType === "string" ? match.mimeType : undefined;
-  if (typeof match.text === "string") {
+  if (typeof match.text === "string" && match.blob === undefined) {
     return { bytes: utf8(match.text), text: match.text, ...(mimeType === undefined ? {} : { mimeType }) };
   }
-  if (typeof match.blob === "string") {
+  if (typeof match.blob === "string" && match.text === undefined) {
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(match.blob)) {
+      return { error: `resources/read for ${uri} has invalid base64` };
+    }
     const bytes = Buffer.from(match.blob, "base64");
-    return { bytes, ...(mimeType === undefined ? {} : { mimeType }) };
+    const textual = mimeType === undefined || /^text\//i.test(mimeType) || /(?:json|xml|yaml|javascript)(?:;|$)/i.test(mimeType) || uri.endsWith("/SKILL.md");
+    let text: string | undefined;
+    if (textual) {
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        if (mimeType === undefined && text.includes("\0")) text = undefined;
+      } catch {
+        if (uri.endsWith("/SKILL.md")) return { error: `${uri} is not UTF-8 text` };
+      }
+    }
+    return { bytes, ...(text === undefined ? {} : { text }), ...(mimeType === undefined ? {} : { mimeType }) };
   }
-  return { error: `resources/read for ${uri} has neither text nor blob` };
-}
-
-const EXECUTION_TOOLS = ["bash", "shell", "exec", "eval", "python"];
-
-export function isCodeExecutionTool(name: string): boolean {
-  return EXECUTION_TOOLS.includes(name);
-}
-
-/** Servers other than `target` that currently have a loaded skill. A read of `target` is cross-origin for each of them. */
-export function crossOriginActors(actingServers: readonly string[], target: string): string[] {
-  return [...new Set(actingServers.filter((server) => server !== target))];
+  return { error: `resources/read for ${uri} must have exactly one of text or blob` };
 }
 
 /** User-facing lines for names that collide inside one server. Paths stay on the entries; this says so explicitly. */

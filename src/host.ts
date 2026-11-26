@@ -1,30 +1,22 @@
+import { Buffer } from "node:buffer";
 import {
   EXTENSION_ID,
-  type DirectoryChild,
-  type McpPort,
   MAX_SKILL_BYTES,
+  type McpPort,
   type Skill,
   SkillsFailure,
-  crossOriginActors,
-  isWithinSkill,
   decodeResource,
   displayNameFor,
   extensionSettings,
   instructionSkillUris,
-  manifestChildren,
-  parseDirectoryResult,
   parseFrontmatter,
   parseGetResult,
   parseListResult,
   parseSkill,
   resolveReference,
-  resourcesFingerprint,
   rpcFailure,
   sameValue,
   sha256,
-  skillIdentity,
-  skillRoot,
-  unrecognizedMetadataKeys,
   validateSkill,
 } from "./model.ts";
 
@@ -36,7 +28,6 @@ export interface CatalogEntry {
   ttlMs?: number;
   cacheScope?: string;
   fetchedAt: number;
-  /** True when the listing did not include this skill and skills/get did. */
   fromGet: boolean;
 }
 
@@ -51,25 +42,20 @@ export interface ReferenceEntry {
   uri: string;
 }
 
-export interface ApprovalPrompt {
-  kind: "load" | "cross-origin";
-  title: string;
-  message: string;
-  server: string;
-  otherServer?: string;
-  uri?: string;
-  dynamic: boolean;
-  changed: boolean;
+interface VerifiedFile {
+  bytes: Uint8Array;
+  text?: string;
+  mimeType?: string;
 }
 
-export type Approver = (prompt: ApprovalPrompt) => Promise<boolean> | boolean;
-
-export interface PresentedSkill {
-  server: string;
-  uri: string;
-  activated: boolean;
-  text: string;
-  mediaType: "skill" | "resource" | "directory";
+interface Snapshot {
+  skill: Skill;
+  fetchedAt: number;
+  ttlMs?: number;
+  cacheScope?: string;
+  fromGet: boolean;
+  files: Map<string, VerifiedFile>;
+  dynamicSizes: Map<string, number>;
 }
 
 interface ServerState {
@@ -77,96 +63,82 @@ interface ServerState {
   protocolVersion: string | undefined;
   directoryRead: boolean;
   instructions: string | undefined;
-  skills: Skill[];
+  entries: Map<string, Snapshot>;
+  lookups: Map<string, { revision: number; promise: Promise<Snapshot> }>;
   rejected: RejectedEntry[];
-  ttlMs?: number;
-  cacheScope?: string;
-  fetchedAt?: number;
   listError?: string;
   unsubs: (() => void)[];
-  dynamicBytes: Map<string, number>;
+  revision: number;
+  listFreshUntil: number;
+  refresh?: Promise<void>;
 }
 
-interface HeldSkill {
-  skill: Skill;
-  fingerprint: string;
-}
+class IntegrityFailure extends SkillsFailure {}
 
 const MAX_PAGES = 1_000;
 
-/**
- * Lookup and load state for the skills-capable servers in one OMP session.
- * File bytes stay in memory. Nothing here opens its own MCP connection.
- */
+/** Reads untrusted skill files through OMP's existing MCP connections; never executes them. */
 export class SkillsHost {
   private readonly servers = new Map<string, ServerState>();
-  private readonly approvals = new Map<string, string>();
-  private readonly held = new Map<string, HeldSkill>();
-  private readonly bytes = new Map<string, Uint8Array>();
-  private readonly refreshTail = new Map<string, Promise<void>>();
-  private readonly dirty = new Set<string>();
 
   async attach(server: string, port: McpPort): Promise<void> {
-    const settings = extensionSettings(port.capabilities());
-    if (!settings.declared) {
-      this.detach(server);
-      return;
-    }
     this.detach(server);
+    const settings = extensionSettings(port.capabilities());
+    if (!settings.declared) return;
     const state: ServerState = {
       port,
       protocolVersion: port.protocolVersion(),
       directoryRead: settings.directoryRead,
       instructions: port.instructions(),
-      skills: [],
+      entries: new Map(),
+      lookups: new Map(),
       rejected: [],
       unsubs: [],
-      dynamicBytes: new Map(),
+      revision: 0,
+      listFreshUntil: 0,
     };
+    this.servers.set(server, state);
     if (!settings.resources) {
       state.listError = `${server} declares ${EXTENSION_ID} but not the resources capability`;
       state.rejected.push({ server, reason: state.listError });
-      this.servers.set(server, state);
       return;
     }
+    const changed = () => {
+      if (this.servers.get(server) === state) void this.enqueueRefresh(server, state);
+    };
     state.unsubs.push(
-      port.onNotification("notifications/resources/list_changed", () => {
-        this.dirty.add(server);
-        void this.enqueueRefresh(server);
-      }),
-      port.onNotification("notifications/skills/list_changed", () => {
-        this.dirty.add(server);
-        void this.enqueueRefresh(server);
-      }),
+      port.onNotification("notifications/resources/list_changed", changed),
+      port.onNotification("notifications/skills/list_changed", changed),
     );
-    this.servers.set(server, state);
-    await this.enqueueRefresh(server);
+    await this.enqueueRefresh(server, state);
   }
 
   detach(server: string): void {
     const state = this.servers.get(server);
     if (!state) return;
-    for (const unsubscribe of state.unsubs) unsubscribe();
     this.servers.delete(server);
-    this.dirty.delete(server);
-    for (const key of [...this.approvals.keys(), ...this.held.keys()]) {
-      if (key.startsWith(`${server}\0`)) {
-        this.approvals.delete(key);
-        this.held.delete(key);
-      }
-    }
-    for (const key of this.bytes.keys()) {
-      if (key.startsWith(`${server}\0`)) this.bytes.delete(key);
-    }
+    state.entries.clear();
+    for (const unsubscribe of state.unsubs) unsubscribe();
   }
 
   clear(): void {
-    for (const server of [...this.servers.keys()]) this.detach(server);
+    for (const server of this.servers.keys()) this.detach(server);
   }
 
   async refresh(server?: string): Promise<void> {
     const names = server === undefined ? [...this.servers.keys()] : [server];
-    await Promise.all(names.map((name) => this.enqueueRefresh(name)));
+    await Promise.all(names.map((name) => {
+      const state = this.servers.get(name);
+      return state ? this.enqueueRefresh(name, state) : Promise.resolve();
+    }));
+  }
+
+  async refreshStaleCatalog(): Promise<void> {
+    const now = Date.now();
+    await Promise.all([...this.servers].map(([server, state]) => {
+      if (!extensionSettings(state.port.capabilities()).resources || now < state.listFreshUntil) return Promise.resolve();
+      return state.refresh ?? this.enqueueRefresh(server, state);
+    }));
   }
 
   serverNames(): string[] {
@@ -176,8 +148,19 @@ export class SkillsHost {
   catalog(): CatalogEntry[] {
     const entries: CatalogEntry[] = [];
     for (const [server, state] of this.servers) {
-      for (const skill of state.skills) {
-        entries.push(this.toEntry(server, state, skill, false));
+      const listed = [...state.entries.values()].filter(entry => !entry.fromGet);
+      const siblings = listed.map(entry => entry.skill);
+      for (const entry of listed) {
+        entries.push({
+          server,
+          skill: entry.skill,
+          displayName: displayNameFor(entry.skill, siblings),
+          directoryRead: state.directoryRead,
+          fetchedAt: entry.fetchedAt,
+          fromGet: entry.fromGet,
+          ...(entry.ttlMs === undefined ? {} : { ttlMs: entry.ttlMs }),
+          ...(entry.cacheScope === undefined ? {} : { cacheScope: entry.cacheScope }),
+        });
       }
     }
     return entries;
@@ -188,426 +171,199 @@ export class SkillsHost {
   }
 
   references(server?: string): ReferenceEntry[] {
-    const out: ReferenceEntry[] = [];
+    const references: ReferenceEntry[] = [];
     for (const [name, state] of this.servers) {
       if (server !== undefined && name !== server) continue;
-      const known = new Set(state.skills.map((skill) => skill.uri));
       for (const uri of instructionSkillUris(state.instructions)) {
-        if (!known.has(uri)) out.push({ server: name, uri });
+        if (!state.entries.has(uri)) references.push({ server: name, uri });
       }
     }
-    return out;
+    return references;
   }
 
   errors(): { server: string; message: string }[] {
-    const out: { server: string; message: string }[] = [];
-    for (const [server, state] of this.servers) {
-      if (state.listError) out.push({ server, message: state.listError });
-    }
-    return out;
-  }
-
-  search(query?: string, server?: string): CatalogEntry[] {
-    const needle = query?.trim().toLowerCase();
-    return this.catalog().filter((entry) => {
-      if (server !== undefined && entry.server !== server) return false;
-      if (!needle) return true;
-      const haystack = `${entry.displayName}\n${entry.skill.frontmatter.description}\n${entry.skill.uri}\n${entry.server}`.toLowerCase();
-      return haystack.includes(needle);
-    });
-  }
-
-  acting(): { server: string; uri: string }[] {
-    return [...this.held.keys()].map((key) => {
-      const split = key.indexOf("\0");
-      return { server: key.slice(0, split), uri: key.slice(split + 1) };
-    });
-  }
-
-  unload(server: string, uri: string): void {
-    this.held.delete(skillIdentity(server, uri));
+    return [...this.servers].flatMap(([server, state]) => state.listError ? [{ server, message: state.listError }] : []);
   }
 
   /**
-   * User inspection. Fetches and verifies SKILL.md, and does not open an acting window.
+   * Native OMP resolver API. Paths are relative to the original SKILL.md root and retain URI
+   * escaping. Reads require no skill-specific approval and confer no execution permission.
    */
-  async show(server: string, uriOrName: string): Promise<PresentedSkill> {
-    const skill = await this.resolve(server, uriOrName);
-    const file = await this.fetchVerified(server, skill, skill.uri, false);
-    return present(server, skill.uri, false, renderSkill(server, skill, file.text, false), "skill");
-  }
-
-  /**
-   * Host skill-loading path. Approval is taken against the entry before any file is fetched.
-   */
-  async load(server: string, uriOrName: string, approve: Approver): Promise<PresentedSkill> {
+  async readFile(server: string, skillUri: string, relativePath: string): Promise<{ content: string | Buffer; contentType: string }> {
     const state = this.requireServer(server);
-    await this.assertSameOrigin(server, approve);
-    const skill = await this.resolve(server, uriOrName);
-    const fingerprint = resourcesFingerprint(skill.resources);
-    const id = skillIdentity(server, skill.uri);
-    const previous = this.approvals.get(id);
-    const dynamic = skill.resources === "dynamic";
-    const changed = previous !== undefined && previous !== fingerprint;
-    if (dynamic || previous !== fingerprint) {
-      const allowed = await approve({
-        kind: "load",
-        title: changed ? `Skill changed on ${server}` : `Load skill from ${server}`,
-        message: approvalMessage(server, skill, changed),
-        server,
-        uri: skill.uri,
-        dynamic,
-        changed,
-      });
-      if (!allowed) throw new SkillsFailure(`Loading ${skill.uri} from ${server} was not approved`);
-    }
-    if (this.servers.get(server) !== state) throw new SkillsFailure(`Connection to ${server} changed during approval`);
-    const file = await this.fetchVerified(server, skill, skill.uri, true);
-    if (this.servers.get(server) !== state) throw new SkillsFailure(`Connection to ${server} changed during load`);
-    if (!dynamic) this.approvals.set(id, fingerprint);
-    else this.approvals.delete(id);
-    this.held.set(id, { skill, fingerprint });
-    return present(server, skill.uri, true, renderSkill(server, skill, file.text, true), "skill");
-  }
-
-  /**
-   * Read one file of a skill. Relative URIs resolve against `skill`. This does not load a skill.
-   */
-  async read(server: string, uri: string, skillRef: string | undefined, approve: Approver): Promise<PresentedSkill> {
-    await this.assertSameOrigin(server, approve);
-    const target = this.absoluteUri(server, uri, skillRef);
-    const skill = await this.skillForFile(server, target, skillRef);
-    const held = this.held.get(skillIdentity(server, skill.uri));
-    const entry = held?.skill ?? skill;
-    if (held && entry.resources !== "dynamic") {
-      const listed = entry.resources.some((resource) => resource.uri === target);
-      if (!listed) {
-        await this.recoverChanged(server, skill.uri, held);
-        throw new SkillsFailure(
-          `${target} is not in the approved files for ${skill.uri} on ${server}. The skill may have changed and needs to be loaded again.`,
-        );
-      }
-    }
-    const file = await this.fetchVerified(server, entry, target, false);
-    const nested = target.endsWith("/SKILL.md") && target !== skill.uri;
-    const ownSkill = target === skill.uri;
-    const banner = nested
-      ? "This nested SKILL.md is supporting content. Its frontmatter was not activated.\n\n"
-      : ownSkill
-        ? "This is a resource read, not a loaded skill.\n\n"
-        : "";
-    return present(server, target, false, `${originBanner(server, target, false)}${banner}${file.text ?? ""}`, "resource");
-  }
-
-  async directory(server: string, uri: string, skillRef: string | undefined, approve: Approver): Promise<PresentedSkill> {
-    await this.assertSameOrigin(server, approve);
-    const state = this.requireServer(server);
-    const directoryUri = uri.replace(/\/$/, "");
-    const skill = this.skillCovering(server, directoryUri, skillRef);
-    const held = skill ? this.held.get(skillIdentity(server, skill.uri)) : undefined;
-    const entry = held?.skill ?? skill;
-    if (!state.directoryRead) {
-      if (!entry || entry.resources === "dynamic") {
-        throw new SkillsFailure(`${server} has not declared directoryRead, and ${directoryUri} is not covered by a skill manifest`);
-      }
-      const children = manifestChildren(entry, directoryUri);
-      return present(server, directoryUri, false, renderDirectory(server, directoryUri, children, []), "directory");
-    }
-    const live = await this.readDirectory(state, directoryUri);
-    if (!entry || entry.resources === "dynamic") {
-      return present(server, directoryUri, false, renderDirectory(server, directoryUri, live, []), "directory");
-    }
-    const allowed = new Set(manifestChildren(entry, directoryUri).map((child) => child.uri));
-    const shown = live.filter((child) => allowed.has(child.uri));
-    const hidden = live.filter((child) => !allowed.has(child.uri)).map((child) => child.uri);
-    if (hidden.length > 0) {
-      await this.recoverChanged(server, entry.uri, held);
-    }
-    return present(server, directoryUri, false, renderDirectory(server, directoryUri, shown, hidden), "directory");
-  }
-
-  private async recoverChanged(server: string, uri: string, held: HeldSkill | undefined): Promise<void> {
-    if (!held) return;
-    try {
-      const fresh = await this.getSkill(server, uri);
-      if (resourcesFingerprint(fresh.resources) !== held.fingerprint) {
-        const id = skillIdentity(server, uri);
-        this.approvals.delete(id);
-        this.held.delete(id);
-      }
-    } catch {
-      // The directory or read error still reports the stale manifest. A failed refresh does not invent a new approval.
-    }
-  }
-
-  private async readDirectory(state: ServerState, uri: string): Promise<DirectoryChild[]> {
-    const children: DirectoryChild[] = [];
-    let cursor: string | undefined;
-    const seen = new Set<string>();
-    for (let page = 0; page < MAX_PAGES; page++) {
-      let result: unknown;
+    const uri = resolveReference(skillUri, relativePath || "SKILL.md");
+    if (!uri) throw new SkillsFailure(`${relativePath} escapes the skill root of ${skillUri}`);
+    if (state.refresh) await state.refresh;
+    this.assertCurrent(server, state);
+    let snapshot = state.entries.get(skillUri);
+    if (!snapshot || !this.fresh(snapshot)) snapshot = await this.getSkill(server, state, skillUri);
+    for (let attempt = 0; ; attempt++) {
+      const revision = state.revision;
       try {
-        result = await state.port.request("resources/directory/read", cursor ? { uri, cursor } : { uri });
+        // Supporting files do not activate nested skills, but their owning entry must be genuine.
+        const entry = await this.fetchVerified(server, state, snapshot, skillUri, revision);
+        this.assertSnapshot(server, state, snapshot, revision);
+        const file = uri === skillUri ? entry : await this.fetchVerified(server, state, snapshot, uri, revision);
+        this.assertSnapshot(server, state, snapshot, revision);
+        return {
+          content: file.text ?? Buffer.from(file.bytes),
+          contentType: file.mimeType ?? (file.text === undefined ? "application/octet-stream" : uri.endsWith(".md") ? "text/markdown" : "text/plain"),
+        };
       } catch (error) {
-        throw rpcFailure(error);
+        this.assertSnapshot(server, state, snapshot, revision);
+        if (!(error instanceof IntegrityFailure) || attempt !== 0) throw error;
+        // Never bless the failed read using a new manifest: fetch and verify the bytes again.
+        snapshot.files.clear();
+        snapshot = await this.getSkill(server, state, skillUri);
       }
-      const parsed = parseDirectoryResult(result, state.protocolVersion);
-      if ("error" in parsed) throw new SkillsFailure(parsed.error);
-      children.push(...parsed.resources);
-      if (!parsed.nextCursor) return children;
-      if (seen.has(parsed.nextCursor)) throw new SkillsFailure("resources/directory/read repeated nextCursor");
-      seen.add(parsed.nextCursor);
-      cursor = parsed.nextCursor;
-    }
-    throw new SkillsFailure("resources/directory/read exceeded the page limit");
-  }
-
-  private absoluteUri(server: string, uri: string, skillRef: string | undefined): string {
-    if (uri.includes("://")) return uri;
-    const skill = skillRef ? this.catalog().find((entry) => entry.server === server && (entry.skill.uri === skillRef || entry.displayName === skillRef)) : undefined;
-    const rootSkill = skill?.skill.uri ?? this.onlyHeld(server);
-    if (!rootSkill) throw new SkillsFailure(`Relative URI ${uri} needs a skill on ${server}`);
-    const resolved = resolveReference(rootSkill, uri);
-    if (!resolved) throw new SkillsFailure(`${uri} escapes the skill root of ${rootSkill}`);
-    return resolved;
-  }
-
-  private onlyHeld(server: string): string | undefined {
-    const matches = this.acting().filter((item) => item.server === server);
-    return matches.length === 1 ? matches[0]?.uri : undefined;
-  }
-
-  private skillCovering(server: string, directoryUri: string, skillRef: string | undefined): Skill | undefined {
-    const state = this.servers.get(server);
-    if (!state) return undefined;
-    if (skillRef) {
-      const named = state.skills.find((skill) => skill.uri === skillRef);
-      if (named && directoryUri.startsWith(skillRoot(named.uri) ?? "\0")) return named;
-    }
-    let best: Skill | undefined;
-    let bestLength = -1;
-    for (const skill of state.skills) {
-      const root = skillRoot(skill.uri);
-      if (root && (directoryUri === root || directoryUri.startsWith(`${root}/`)) && root.length > bestLength) {
-        best = skill;
-        bestLength = root.length;
-      }
-    }
-    return best;
-  }
-
-  private async skillForFile(server: string, fileUri: string, skillRef: string | undefined): Promise<Skill> {
-    if (skillRef) return this.resolve(server, skillRef);
-    const covering = this.skillCovering(server, fileUri, undefined);
-    if (covering && (covering.resources === "dynamic" || covering.resources.some((resource) => resource.uri === fileUri) || fileUri === covering.uri)) {
-      return covering;
-    }
-    if (fileUri.endsWith("/SKILL.md")) return this.resolve(server, fileUri);
-    throw new SkillsFailure(`${fileUri} is not a file of a known skill on ${server}`);
-  }
-
-  private async resolve(server: string, uriOrName: string): Promise<Skill> {
-    const state = this.requireListed(server);
-    if (uriOrName.includes("://")) {
-      const known = state.skills.find((skill) => skill.uri === uriOrName);
-      if (known && this.listingFresh(state)) return known;
-      return this.getSkill(server, uriOrName);
-    }
-    const matches = state.skills.filter((skill) => skill.frontmatter.name === uriOrName || displayNameFor(skill, state.skills) === uriOrName);
-    if (matches.length === 1 && matches[0]) return matches[0];
-    if (matches.length > 1) {
-      const choices = matches.map((skill) => skill.uri).join(", ");
-      throw new SkillsFailure(`More than one skill on ${server} is named ${uriOrName}: ${choices}`);
-    }
-    throw new SkillsFailure(`No listed skill named ${uriOrName} on ${server}. Pass the SKILL.md URI to load a skill the listing omitted.`);
-  }
-
-  private async getSkill(server: string, uri: string): Promise<Skill> {
-    const state = this.requireServer(server);
-    if (!extensionSettings(state.port.capabilities()).declared) {
-      throw new SkillsFailure(`${server} has not declared the skills extension`);
-    }
-    let result: unknown;
-    try {
-      result = await state.port.request("skills/get", { uri });
-    } catch (error) {
-      throw rpcFailure(error);
-    }
-    const parsed = parseGetResult(result, state.protocolVersion);
-    if ("error" in parsed) throw new SkillsFailure(parsed.error);
-    const skill = parseSkill(parsed.skill);
-    if ("error" in skill) throw new SkillsFailure(skill.error);
-    if (skill.skill.uri !== uri) throw new SkillsFailure(`skills/get returned a different URI than ${uri}`);
-    const verdict = validateSkill(skill.skill);
-    if (!verdict.ok) throw new SkillsFailure(verdict.reason);
-    const index = state.skills.findIndex((item) => item.uri === skill.skill.uri);
-    if (index === -1) state.skills.push(skill.skill);
-    else state.skills[index] = skill.skill;
-    return skill.skill;
-  }
-
-  private async fetchVerified(server: string, skill: Skill, uri: string, activating: boolean): Promise<{ text?: string; bytes: Uint8Array }> {
-    const state = this.requireServer(server);
-    if (!isWithinSkill(skill.uri, uri)) throw new SkillsFailure(`${uri} is outside the skill root of ${skill.uri}`);
-    let current = skill;
-    let listed = current.resources === "dynamic" ? undefined : current.resources.find((resource) => resource.uri === uri);
-    if (current.resources !== "dynamic" && !listed) {
-      throw new SkillsFailure(`${uri} is not listed in ${current.uri}`);
-    }
-    const cached = this.takeCached(server, uri, listed);
-    if (cached) {
-      if (uri === skill.uri) {
-        const parsed = parseFrontmatter(cached.text);
-        if ("error" in parsed || !sameValue(parsed.value, skill.frontmatter)) throw new SkillsFailure(`Cached frontmatter differs from the entry on ${server}`);
-      }
-      return cached;
-    }
-    let result: unknown;
-    try {
-      result = await state.port.request("resources/read", { uri });
-    } catch (error) {
-      throw rpcFailure(error);
-    }
-    const decoded = decodeResource(result, uri);
-    if ("error" in decoded) throw new SkillsFailure(decoded.error);
-    if (listed && !bytesMatch(decoded.bytes, listed)) {
-      const fresh = await this.getSkill(server, current.uri);
-      const moved = resourcesFingerprint(fresh.resources) !== resourcesFingerprint(current.resources);
-      if (moved) {
-        this.approvals.delete(skillIdentity(server, current.uri));
-        this.held.delete(skillIdentity(server, current.uri));
-        throw new SkillsFailure(`${uri} on ${server} no longer matches the approved skill. Load it again to approve the new files.`);
-      }
-      current = fresh;
-      listed = fresh.resources === "dynamic" ? undefined : fresh.resources.find((resource) => resource.uri === uri);
-      if (!listed || !bytesMatch(decoded.bytes, listed)) {
-        throw new SkillsFailure(`${uri} on ${server} does not match the digest or size in the skill entry`);
-      }
-    }
-    if (current.resources === "dynamic") {
-      const used = state.dynamicBytes.get(current.uri) ?? 0;
-      const next = used + decoded.bytes.byteLength;
-      if (next > MAX_SKILL_BYTES) {
-        throw new SkillsFailure(`${current.uri} on ${server} reached the ${MAX_SKILL_BYTES} byte limit for a dynamic skill`);
-      }
-      state.dynamicBytes.set(current.uri, next);
-    }
-    if (uri === current.uri || (activating && uri.endsWith("/SKILL.md"))) {
-      const frontmatter = parseFrontmatter(decoded.text ?? "");
-      if ("error" in frontmatter) throw new SkillsFailure(frontmatter.error);
-      if (!sameValue(frontmatter.value, current.frontmatter)) {
-        throw new SkillsFailure(`Frontmatter of ${uri} does not match the skill entry from ${server}`);
-      }
-    }
-    if (this.servers.get(server) !== state) throw new SkillsFailure(`Connection to ${server} changed during read`);
-    if (listed) this.bytes.set(`${server}\0${uri}\0${listed.digest}`, decoded.bytes);
-    return { bytes: decoded.bytes, ...(decoded.text === undefined ? {} : { text: decoded.text }) };
-  }
-
-  private takeCached(server: string, uri: string, listed: { digest: string; size: number } | undefined): { bytes: Uint8Array; text: string } | undefined {
-    if (!listed) return undefined;
-    const key = `${server}\0${uri}\0${listed.digest}`;
-    const cached = this.bytes.get(key);
-    if (!cached) return undefined;
-    if (sha256(cached) !== listed.digest || cached.byteLength !== listed.size) {
-      this.bytes.delete(key);
-      return undefined;
-    }
-    return { bytes: cached, text: new TextDecoder("utf-8", { fatal: false }).decode(cached) };
-  }
-
-  private async assertSameOrigin(server: string, approve: Approver): Promise<void> {
-    const others = crossOriginActors(this.acting().map((item) => item.server), server);
-    for (const other of others) {
-      const allowed = await approve({
-        kind: "cross-origin",
-        title: `Read ${server} while a skill from ${other} is loaded`,
-        message: `A skill from ${other} is loaded. This read uses ${server}. Approve this cross-origin read?`,
-        server,
-        otherServer: other,
-        dynamic: false,
-        changed: false,
-      });
-      if (!allowed) throw new SkillsFailure(`Cross-origin read from ${other} to ${server} was not approved`);
     }
   }
 
   private requireServer(server: string): ServerState {
     const state = this.servers.get(server);
     if (!state) throw new SkillsFailure(`${server} is not a connected skills server`);
+    if (!extensionSettings(state.port.capabilities()).resources) throw new SkillsFailure(state.listError ?? `${server} has no resources capability`);
     return state;
   }
 
-  private requireListed(server: string): ServerState {
-    const state = this.requireServer(server);
-    if (state.listError && state.skills.length === 0 && !extensionSettings(state.port.capabilities()).resources) {
-      throw new SkillsFailure(state.listError);
+  private assertCurrent(server: string, state: ServerState, revision?: number): void {
+    if (this.servers.get(server) !== state) throw new SkillsFailure(`Connection to ${server} changed during read`);
+    if (revision !== undefined && state.revision !== revision) throw new SkillsFailure(`Skill metadata on ${server} changed during read`);
+  }
+
+  private assertSnapshot(server: string, state: ServerState, snapshot: Snapshot, revision: number): void {
+    this.assertCurrent(server, state, revision);
+    if (state.entries.get(snapshot.skill.uri) !== snapshot) throw new SkillsFailure(`Skill metadata on ${server} changed during read`);
+  }
+
+  private fresh(snapshot: Snapshot): boolean {
+    return snapshot.ttlMs === undefined || Date.now() - snapshot.fetchedAt < snapshot.ttlMs;
+  }
+
+  private getSkill(server: string, state: ServerState, uri: string): Promise<Snapshot> {
+    const existing = state.lookups.get(uri);
+    if (existing?.revision === state.revision) return existing.promise;
+    const lookup = { revision: state.revision, promise: this.pullSkill(server, state, uri) };
+    state.lookups.set(uri, lookup);
+    const clear = () => {
+      if (state.lookups.get(uri) === lookup) state.lookups.delete(uri);
+    };
+    void lookup.promise.then(clear, clear);
+    return lookup.promise;
+  }
+
+  private async pullSkill(server: string, state: ServerState, uri: string): Promise<Snapshot> {
+    const revision = state.revision;
+    const previous = state.entries.get(uri);
+    let result: unknown;
+    try {
+      result = await state.port.request("skills/get", { uri });
+    } catch (error) {
+      this.assertCurrent(server, state, revision);
+      throw rpcFailure(error);
     }
-    return state;
+    this.assertCurrent(server, state, revision);
+    if (state.entries.get(uri) !== previous) throw new SkillsFailure(`Skill metadata on ${server} changed during lookup`);
+    const parsed = parseGetResult(result, state.protocolVersion);
+    if ("error" in parsed) throw new SkillsFailure(parsed.error);
+    const entry = parseSkill(parsed.skill);
+    if ("error" in entry) throw new SkillsFailure(entry.error);
+    if (entry.skill.uri !== uri) throw new SkillsFailure(`skills/get returned a different URI than ${uri}`);
+    const verdict = validateSkill(entry.skill);
+    if (!verdict.ok) throw new SkillsFailure(verdict.reason);
+    const snapshot = this.snapshot(entry.skill, parsed, previous?.fromGet ?? true);
+    state.entries.set(uri, snapshot);
+    return snapshot;
   }
 
-  private listingFresh(state: ServerState): boolean {
-    if (state.fetchedAt === undefined) return false;
-    if (state.ttlMs === undefined) return true;
-    return Date.now() - state.fetchedAt < state.ttlMs;
+  private async fetchVerified(server: string, state: ServerState, snapshot: Snapshot, uri: string, revision: number): Promise<VerifiedFile> {
+    this.assertSnapshot(server, state, snapshot, revision);
+    const skill = snapshot.skill;
+    const listed = skill.resources === "dynamic" ? undefined : skill.resources.find((resource) => resource.uri === uri);
+    if (skill.resources !== "dynamic" && !listed) throw new IntegrityFailure(`${uri} is not listed in ${skill.uri}`);
+    const cached = listed ? snapshot.files.get(uri) : undefined;
+    if (cached && bytesMatch(cached.bytes, listed!)) return cached;
+    let result: unknown;
+    try {
+      result = await state.port.request("resources/read", { uri });
+    } catch (error) {
+      this.assertSnapshot(server, state, snapshot, revision);
+      throw rpcFailure(error);
+    }
+    this.assertSnapshot(server, state, snapshot, revision);
+    const decoded = decodeResource(result, uri);
+    if ("error" in decoded) throw new SkillsFailure(decoded.error);
+    if (decoded.bytes.byteLength > MAX_SKILL_BYTES) throw new SkillsFailure(`${uri} exceeds the ${MAX_SKILL_BYTES} byte limit`);
+    if (listed && !bytesMatch(decoded.bytes, listed)) throw new IntegrityFailure(`${uri} on ${server} does not match the digest or size in the skill entry`);
+    if (uri === skill.uri) {
+      const frontmatter = parseFrontmatter(decoded.text ?? "");
+      if ("error" in frontmatter) throw new IntegrityFailure(frontmatter.error);
+      if (!sameValue(frontmatter.value, skill.frontmatter)) throw new IntegrityFailure(`Frontmatter of ${uri} does not match the skill entry from ${server}`);
+    }
+    if (skill.resources === "dynamic") {
+      let total = decoded.bytes.byteLength;
+      for (const [other, size] of snapshot.dynamicSizes) if (other !== uri) total += size;
+      if (total > MAX_SKILL_BYTES) throw new SkillsFailure(`${skill.uri} on ${server} reached the ${MAX_SKILL_BYTES} byte limit for a dynamic skill`);
+      snapshot.dynamicSizes.set(uri, decoded.bytes.byteLength);
+    } else {
+      snapshot.files.set(uri, decoded);
+    }
+    return decoded;
   }
 
-  private toEntry(server: string, state: ServerState, skill: Skill, fromGet: boolean): CatalogEntry {
+  private snapshot(skill: Skill, cache: { ttlMs?: number; cacheScope?: string }, fromGet: boolean): Snapshot {
     return {
-      server,
       skill,
-      displayName: displayNameFor(skill, state.skills),
-      directoryRead: state.directoryRead,
-      ...(state.ttlMs === undefined ? {} : { ttlMs: state.ttlMs }),
-      ...(state.cacheScope === undefined ? {} : { cacheScope: state.cacheScope }),
-      fetchedAt: state.fetchedAt ?? Date.now(),
+      fetchedAt: Date.now(),
+      ...(cache.ttlMs === undefined ? {} : { ttlMs: cache.ttlMs }),
+      ...(cache.cacheScope === undefined ? {} : { cacheScope: cache.cacheScope }),
       fromGet,
+      files: new Map(),
+      dynamicSizes: new Map(),
     };
   }
 
-  private enqueueRefresh(server: string): Promise<void> {
-    const previous = this.refreshTail.get(server) ?? Promise.resolve();
-    const next = previous.then(() => this.pullUntilClean(server));
-    this.refreshTail.set(server, next);
-    return next;
+  private enqueueRefresh(server: string, state: ServerState): Promise<void> {
+    state.revision++;
+    if (state.refresh) return state.refresh;
+    const pending = this.pullUntilCurrent(server, state);
+    state.refresh = pending;
+    void pending.finally(() => { if (state.refresh === pending) state.refresh = undefined; });
+    return pending;
   }
 
-  private async pullUntilClean(server: string): Promise<void> {
+  private async pullUntilCurrent(server: string, state: ServerState): Promise<void> {
     do {
-      this.dirty.delete(server);
-      await this.pullList(server);
-    } while (this.dirty.has(server));
+      const revision = state.revision;
+      await this.pullList(server, state, revision);
+      if (this.servers.get(server) !== state || state.revision === revision) return;
+    } while (true);
   }
 
-  private async pullList(server: string): Promise<void> {
-    const state = this.servers.get(server);
-    if (!state || !extensionSettings(state.port.capabilities()).declared) return;
-    if (!extensionSettings(state.port.capabilities()).resources) return;
-    const skills: Skill[] = [];
+  private async pullList(server: string, state: ServerState, revision: number): Promise<void> {
+    const entries = new Map<string, Snapshot>();
     const rejected: RejectedEntry[] = [];
     let cursor: string | undefined;
-    let ttlMs: number | undefined;
-    let cacheScope: string | undefined;
+    let cache: { ttlMs?: number; cacheScope?: string } = {};
     const seen = new Set<string>();
     try {
       for (let page = 0; page < MAX_PAGES; page++) {
         const result = await state.port.request("skills/list", cursor ? { cursor } : {});
+        this.assertCurrent(server, state, revision);
         const parsed = parseListResult(result, state.protocolVersion);
         if ("error" in parsed) throw new SkillsFailure(parsed.error);
-        if (page === 0) {
-          ttlMs = parsed.ttlMs;
-          cacheScope = parsed.cacheScope;
-        }
+        if (page === 0) cache = { ...(parsed.ttlMs === undefined ? {} : { ttlMs: parsed.ttlMs }), ...(parsed.cacheScope === undefined ? {} : { cacheScope: parsed.cacheScope }) };
         for (const item of parsed.skills) {
-          const skill = parseSkill(item);
-          if ("error" in skill) {
-            const uri = typeof item === "object" && item !== null && "uri" in item && typeof item.uri === "string" ? item.uri : undefined;
-            rejected.push({ server, ...(uri === undefined ? {} : { uri }), reason: skill.error });
+          const parsedSkill = parseSkill(item);
+          if ("error" in parsedSkill) {
+            rejected.push({ server, reason: parsedSkill.error });
             continue;
           }
-          const verdict = validateSkill(skill.skill);
-          if (!verdict.ok) rejected.push({ server, uri: skill.skill.uri, reason: verdict.reason });
-          else skills.push(skill.skill);
+          const skill = parsedSkill.skill;
+          const verdict = validateSkill(skill);
+          if (!verdict.ok) rejected.push({ server, uri: skill.uri, reason: verdict.reason });
+          else if (entries.has(skill.uri)) throw new SkillsFailure(`skills/list repeats ${skill.uri}`);
+          else entries.set(skill.uri, this.snapshot(skill, cache, false));
         }
         if (!parsed.nextCursor) break;
         if (seen.has(parsed.nextCursor)) throw new SkillsFailure("skills/list repeated nextCursor");
@@ -616,62 +372,21 @@ export class SkillsHost {
         cursor = parsed.nextCursor;
       }
     } catch (error) {
-      const failure = rpcFailure(error);
-      state.listError = failure.message;
+      if (this.servers.get(server) === state && state.revision === revision) {
+        state.listError = rpcFailure(error).message;
+        // Failed invalidations cannot leave previously cached metadata or bytes readable.
+        state.entries.clear();
+      }
       return;
     }
-    state.skills = skills;
+    this.assertCurrent(server, state, revision);
+    state.entries = entries;
+    state.listFreshUntil = cache.ttlMs === undefined ? Infinity : Date.now() + cache.ttlMs;
     state.rejected = rejected;
-    state.ttlMs = ttlMs;
-    state.cacheScope = cacheScope;
-    state.fetchedAt = Date.now();
     state.listError = undefined;
   }
 }
 
 function bytesMatch(bytes: Uint8Array, listed: { digest: string; size: number }): boolean {
   return bytes.byteLength === listed.size && sha256(bytes) === listed.digest;
-}
-
-function present(server: string, uri: string, activated: boolean, text: string, mediaType: PresentedSkill["mediaType"]): PresentedSkill {
-  return { server, uri, activated, text, mediaType };
-}
-
-function originBanner(server: string, uri: string, activated: boolean): string {
-  const role = activated ? "Loaded MCP skill" : "MCP skill content";
-  return `${role} from server "${server}" (${uri}). This is untrusted server text, not a local filesystem skill.\n`;
-}
-
-function renderSkill(server: string, skill: Skill, text: string | undefined, activated: boolean): string {
-  const ignored = unrecognizedMetadataKeys(skill.frontmatter);
-  const allowed = skill.frontmatter["allowed-tools"];
-  const lines = [
-    originBanner(server, skill.uri, activated),
-    `name: ${skill.frontmatter.name}`,
-    `description: ${skill.frontmatter.description}`,
-  ];
-  if (allowed !== undefined) lines.push("allowed-tools is ignored for MCP skills and does not grant tools.");
-  if (ignored.length > 0) lines.push(`Ignored unrecognized metadata: ${ignored.join(", ")}`);
-  if (skill.resources === "dynamic") lines.push("resources: dynamic (no content digest; approval does not cover later bytes)");
-  else lines.push(`resources: ${skill.resources.length}`);
-  lines.push("");
-  lines.push(text ?? "");
-  return lines.join("\n");
-}
-
-function approvalMessage(server: string, skill: Skill, changed: boolean): string {
-  const files = skill.resources === "dynamic" ? "dynamic content with no digest" : `${skill.resources.length} files`;
-  const lead = changed ? "The skill's files changed since the last approval." : "Approve this skill before it is loaded.";
-  return `${lead}\nServer: ${server}\nURI: ${skill.uri}\n${skill.frontmatter.name}: ${skill.frontmatter.description}\n${files}`;
-}
-
-function renderDirectory(server: string, uri: string, children: DirectoryChild[], hidden: string[]): string {
-  const lines = [originBanner(server, uri, false), ...children.map((child) => `${child.mimeType ?? "file"}\t${child.name}\t${child.uri}`)];
-  if (hidden.length > 0) {
-    lines.push("");
-    lines.push("These names are not part of the approved skill and were not listed as its files. Load the skill again if it changed:");
-    lines.push(...hidden.map((item) => `- ${item}`));
-  }
-  if (children.length === 0) lines.push("(empty)");
-  return lines.join("\n");
 }

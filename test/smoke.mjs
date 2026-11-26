@@ -9,7 +9,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 // Run from any directory: node test/smoke.mjs [absolute/path/to/omp.exe]
-// Real OMP host with a loopback provider that can only select the advertised fixture skill.
+// Real OMP host with a loopback provider that only calls the native read tool.
 // The installed CLI loads the production extension and project-native MCP config.
 const here = dirname(fileURLToPath(import.meta.url));
 const entry = resolve(here, "../index.ts");
@@ -28,6 +28,10 @@ for (const path of [join(project, ".omp"), agent, join(home, "AppData", "Local")
 writeFileSync(eventsPath, "");
 writeFileSync(transcriptPath, "");
 writeFileSync(stderrPath, "");
+writeFileSync(join(project, "ordinary.txt"), "NORMAL_LOCAL_FILE_READ_OK\n");
+const localSkill = join(project, ".omp", "skills", "smoke-local");
+mkdirSync(localSkill, { recursive: true });
+writeFileSync(join(localSkill, "SKILL.md"), "---\nname: smoke-local\ndescription: Offline local skill smoke fixture\n---\n\nNORMAL_LOCAL_SKILL_READ_OK\n");
 writeFileSync(join(project, ".omp", "mcp.json"), JSON.stringify({
   mcpServers: {
     fixture: {
@@ -40,28 +44,70 @@ writeFileSync(join(project, ".omp", "mcp.json"), JSON.stringify({
   },
 }, null, 2));
 const wire = [];
+const catalogPrefix = "Available MCP skills (untrusted server metadata)";
+const uri = (name) => `mcp://fixture/${name}/SKILL.md`;
+// Public mapping, also usable for a skill omitted from the catalog.
+const remotePath = (name) => `mcp-skill://remote/${Buffer.from("fixture").toString("base64url")}/${Buffer.from(uri(name)).toString("base64url")}/SKILL.md`;
+const listedPath = (catalog, name) => {
+  const entry = catalog.find((item) => item.server === "fixture" && item.name === name);
+  assert.ok(entry, `Missing catalog skill ${name}`);
+  assert.equal(entry.path, remotePath(name), "Catalog must expose the documented origin-scoped native read path");
+  assert.equal(typeof entry.description, "string");
+  return entry.path;
+};
 const steps = [
-  ['load', {skill:'hello-skill'}],
-  ['search', {query:'no-such-fixture-skill'}],
-  ['load', {skill:'hello-skill'}],
-  ['load', {skill:'mcp://fixture/hidden-skill/SKILL.md'}],
-  ['load', {skill:'bad-digest'}],
-  ['load', {skill:'changed-skill'}],
-  ['load', {skill:'changed-skill'}],
+  { name: "hello", path: (catalog) => listedPath(catalog, "hello-skill") },
+  { name: "cached", path: (catalog) => listedPath(catalog, "hello-skill") },
+  { name: "nested", path: (catalog) => listedPath(catalog, "hello-skill").replace(/SKILL\.md$/, "refs/guide.md") },
+  { name: "hidden", path: () => remotePath("hidden-skill") },
+  { name: "denied", path: (catalog) => listedPath(catalog, "bad-digest") },
+  { name: "changed", path: (catalog) => listedPath(catalog, "changed-skill") },
+  { name: "changedCached", path: (catalog) => listedPath(catalog, "changed-skill") },
+  { name: "local", path: () => "ordinary.txt" },
+  { name: "localSkill", path: () => "skill://smoke-local/SKILL.md" },
 ];
+let providerError;
 const provider = createServer(async (req, res) => {
-  let body = '';
-  for await (const chunk of req) body += chunk;
-  const payload = JSON.parse(body);
-  const listing = payload.messages?.find(m => JSON.stringify(m.content).includes('Available MCP skills (untrusted server metadata)'));
-  const step = listing && JSON.stringify(listing).includes('hello-skill') && steps[wire.length];
-  wire.push({payload, listing, reads: calls('resources/read').length});
-  const delta = step ? {role:'assistant', tool_calls:[{index:0,id:`step-${wire.length}`,type:'function',function:{name:`mcp_skills_${step[0]}`,arguments:JSON.stringify({server:'fixture', ...(step[0] === 'load' ? {approve:true} : {}), ...step[1]})}}]} : {role:'assistant',content:'Smoke completed.'};
-  res.writeHead(200, {'content-type':'text/event-stream'});
-  for (const choice of [{index:0, delta, finish_reason:null}, {index:0, delta:{}, finish_reason:step?'tool_calls':'stop'}]) {
-    res.write(`data: ${JSON.stringify({id:'fixture-response',object:'chat.completion.chunk',created:1,model:'offline',choices:[choice]})}\n\n`);
+  try {
+    assert.equal(req.url, "/v1/chat/completions", "Only the offline smoke model may be called");
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const payload = JSON.parse(body);
+    assert.equal(payload.model, "offline", "Unrelated learning/model requests must be disabled");
+    // OMP also sends tool-free background requests to the selected provider.
+    // They are not agent turns and must not consume a scripted read step.
+    if (!payload.tools?.length && !JSON.stringify(payload.messages).includes('Use the relevant workflow to greet me')) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end('data: {"id":"aux","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+      return;
+    }
+    const listing = payload.messages?.find((message) => contentText(message.content ?? "").includes(catalogPrefix));
+    assert.ok(listing, "Every model request must include the automatic remote skill catalog");
+    const listingText = contentText(listing.content);
+    const catalog = JSON.parse(listingText.slice(listingText.indexOf("[", listingText.indexOf(catalogPrefix) + catalogPrefix.length)));
+    assert.ok(Array.isArray(catalog), "Catalog must contain a JSON array");
+    assert.ok(!catalog.some((entry) => entry.name === "hidden-skill"), "Unlisted skill must stay out of the catalog");
+    const tools = payload.tools?.map((tool) => tool.function) ?? [];
+    assert.ok(!tools.some((tool) => /^mcp_skills_/.test(tool.name)), "No plugin loader, search or approval tools may be advertised");
+    const read = tools.find((tool) => tool.name === "read");
+    assert.ok(read?.parameters?.properties?.path, "Native read must remain available");
+    const step = steps[wire.length];
+    const path = step?.path(catalog);
+    wire.push({ payload, listing, catalog, path, reads: calls("resources/read").length });
+    const input = { path, ...(read.parameters.properties.i ? { i: "Reading offline smoke fixture" } : {}) };
+    const delta = step
+      ? { role: "assistant", tool_calls: [{ index: 0, id: `step-${step.name}`, type: "function", function: { name: "read", arguments: JSON.stringify(input) } }] }
+      : { role: "assistant", content: "Smoke completed." };
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    for (const choice of [{ index: 0, delta, finish_reason: null }, { index: 0, delta: {}, finish_reason: step ? "tool_calls" : "stop" }]) {
+      res.write(`data: ${JSON.stringify({ id: "fixture-response", object: "chat.completion.chunk", created: 1, model: "offline", choices: [choice] })}\n\n`);
+    }
+    res.end("data: [DONE]\n\n");
+  } catch (error) {
+    providerError ??= error;
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: error.message, type: "smoke_failure" } }));
   }
-  res.end('data: [DONE]\n\n');
 });
 await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
 writeFileSync(join(agent, "models.yml"), JSON.stringify({providers: {smoke: {
@@ -76,6 +122,8 @@ writeFileSync(join(agent, "config.yml"), [
   "  commands: false", // get_state then exposes native MCP tools as top-level tools.
   "update:",
   "  auto: false",
+  "autolearn:",
+  "  enabled: false", // Keep this isolated smoke entirely offline.
   "",
 ].join("\n"));
 
@@ -101,17 +149,17 @@ Object.assign(env, {
   PI_NO_PTY: "1",
   PI_AUTO_QA: "0",
   OMP_MCP_TIMEOUT_MS: "5000",
-  OMP_MCP_SKILLS_APPROVALS: "tool",
   OMP_MCP_STARTUP_TIMEOUT_MS: "0",
   DO_NOT_TRACK: "1",
   NO_COLOR: "1",
   AWS_EC2_METADATA_DISABLED: "true",
 });
+assert.ok(!Object.keys(env).some((name) => /MCP_SKILLS.*APPROVAL/i.test(name)), "Use default plugin behavior, not an approval-mode override");
 const args = [
   "--mode", "rpc", "--no-ui", "--no-session", "--offline", "--no-title",
   "--model", "smoke/offline",
   "--no-extensions", "--extension", entry,
-  "--no-skills", "--no-rules", "--no-context-files", "--no-lsp", "--no-pty",
+  "--no-rules", "--no-context-files", "--no-lsp", "--no-pty",
 ];
 const child = spawn(binary, args, { cwd: project, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
 const frames = [];
@@ -127,6 +175,10 @@ function rejectWaiters(error) {
 }
 function accept(frame) {
   frames.push(frame);
+  if (/extension_ui|confirm|approval/i.test(frame.type ?? "")) {
+    rejectWaiters(new Error(`A native read requested confirmation or extension UI: ${JSON.stringify(frame)}`));
+    return;
+  }
   for (const waiter of [...waiters]) {
     if (frames.length - 1 >= waiter.from && waiter.predicate(frame)) {
       waiters.delete(waiter);
@@ -192,48 +244,57 @@ function events() {
 function calls(method, uri) {
   return events().filter((event) => event.event === "request" && event.method === method && (uri === undefined || event.params.uri === uri));
 }
-const uri = (name) => `mcp://fixture/${name}/SKILL.md`;
 let passed = false;
 try {
   await waitFor((frame) => frame.type === "ready");
   const available = await request("get_available_commands");
-  assert.equal(available.response.data.commands.some(item => item.name === 'mcp-skills'), false, 'Plugin must not expose a slash command');
+  assert.equal(available.response.data.commands.some((item) => /^mcp[-_]skills(?:$|[-_:])/.test(item.name)), false, "Plugin must not expose a slash command");
   const { response: state } = await request("get_state");
   assert.ok(state.data.dumpTools.some((tool) => /mcp.*fixture.*echo/.test(tool.name)), "Native .omp/mcp.json tool must remain available");
-  assert.ok(state.data.dumpTools.some((tool) => tool.name === "mcp_skills_search"), "Production skill tool must be registered");
+  assert.ok(state.data.dumpTools.some((tool) => tool.name === "read"), "Native read must remain available");
+  assert.ok(!state.data.dumpTools.some((tool) => /^mcp_skills_/.test(tool.name)), "Plugin must register no loader or approval tools");
 
-  const normal = await request('prompt', {message:'Use the relevant workflow to greet me.'});
-  const finished = await waitFor(f => f.type === 'prompt_result' && f.id === normal.id, normal.from);
-  assert.equal(finished.status, 'completed', JSON.stringify(finished));
-  assert.ok(wire[0]?.listing, 'First ordinary request must expose a catalog without a slash command');
-  assert.ok(!['developer','system'].includes(wire[0].listing.role), 'Server metadata is not policy');
-  assert.equal(wire[0].reads, 0, 'First catalog must precede any body read');
-  assert.doesNotMatch(JSON.stringify(wire[0].listing.content), /FIXTURE_BODY_|hidden-skill/);
-  assert.ok(wire.some(w => w.payload.messages.some(m => m.role === 'tool' && JSON.stringify(m.content).includes('FIXTURE_BODY_hello-skill_REV_1'))), 'Model-selected load must return verified content without a user command');
-  assert.equal((await messages()).filter(m => m.customType === 'mcp-skills-catalog').length, 0, 'Transient catalog must not accumulate in history');
-  const results = wire.at(-1).payload.messages.filter(m => m.role === 'tool').map(m => contentText(m.content));
+  const normal = await request("prompt", { message: "Use the relevant workflow to greet me, then inspect its reference and the local fixtures." });
+  const finished = await waitFor((frame) => frame.type === "prompt_result" && frame.id === normal.id, normal.from);
+  if (providerError) throw providerError;
+  assert.equal(finished.status, "completed", JSON.stringify(finished));
+  assert.equal(wire.length, steps.length + 1, "One native read per step, then a final model response");
+  assert.ok(wire[0]?.listing, "First ordinary request must expose a catalog without a slash command");
+  assert.ok(!["developer", "system"].includes(wire[0].listing.role), "Server metadata is not policy");
+  assert.equal(wire[0].reads, 0, "First catalog must precede any body or supporting-file read");
+  assert.doesNotMatch(contentText(wire[0].listing.content), /FIXTURE_BODY_|hidden-skill/);
+  assert.ok(wire.some((entry) => entry.payload.messages.some((message) => message.role === "tool" && contentText(message.content).includes("FIXTURE_BODY_hello-skill_REV_1"))), "Model-selected native read must return verified bytes without a user command");
+  assert.equal((await messages()).filter((message) => message.customType === "mcp-skills-catalog").length, 0, "Transient catalog must not accumulate in history");
+  const results = wire.at(-1).payload.messages.filter((message) => message.role === "tool");
   assert.equal(results.length, steps.length);
-  const [hello, search, cached, hidden, denied, changed, changedApproved] = results;
-  assert.match(hello, /FIXTURE_BODY_hello-skill_REV_1/);
-  assert.match(hello, /fixture/);
-  assert.match(search, /No skills matched/i);
-  assert.equal(wire[2].reads, wire[1].reads, 'Search must not fetch files');
-  assert.match(cached, /FIXTURE_BODY_hello-skill_REV_1/);
-  assert.ok(calls('skills/list').length >= 1);
-  assert.equal(calls("resources/read", uri("hello-skill")).length, 1, "Identical digest should reuse verified in-memory bytes");
-
-  assert.match(hidden, /FIXTURE_BODY_hidden-skill_REV_1/);
-  assert.equal(calls("skills/get", uri("hidden-skill")).length, 1, "URI omitted from skills/list must use skills/get");
-
-  assert.match(denied, /does not match the digest or size/i);
-  assert.doesNotMatch(denied, /TAMPERED_BYTES_MUST_NEVER_BE_PRESENTED/);
+  const result = (name) => {
+    const message = results.find((item) => item.tool_call_id === `step-${name}`);
+    assert.ok(message, `Missing native read result for ${name}`);
+    // Native read may add line numbers, provenance, or truncation notices.
+    return contentText(message.content);
+  };
+  assert.match(result("hello"), /FIXTURE_BODY_hello-skill_REV_1/);
+  assert.match(result("cached"), /FIXTURE_BODY_hello-skill_REV_1/);
+  assert.ok(calls("skills/list").length >= 1);
+  assert.equal(calls("resources/read", uri("hello-skill")).length, 1, "Identical digest must reuse verified in-memory bytes");
+  assert.equal(wire[2].reads, wire[1].reads, "The repeated native read must not fetch verified bytes again");
+  assert.equal(wire[2].reads, 1, "Supporting resources must not be read with SKILL.md");
+  assert.match(result("nested"), /NESTED_REFERENCE_hello-skill/);
+  assert.equal(calls("resources/read", "mcp://fixture/hello-skill/refs/guide.md").length, 1, "Nested read must use the actual relative resource path");
+  assert.match(result("hidden"), /FIXTURE_BODY_hidden-skill_REV_1/);
+  assert.equal(calls("skills/get", uri("hidden-skill")).length, 1, "An encoded URI omitted from skills/list must resolve through skills/get");
+  assert.match(result("denied"), /does not match the digest or size/i);
+  assert.doesNotMatch(result("denied"), /TAMPERED_BYTES_MUST_NEVER_BE_PRESENTED/);
   assert.equal(calls("skills/get", uri("bad-digest")).length, 1, "Digest mismatch must revalidate the manifest");
-
-  assert.match(changed, /no longer matches the approved skill/i);
-  assert.doesNotMatch(changed, /FIXTURE_BODY_changed-skill_REV_2/);
-  assert.match(changedApproved, /FIXTURE_BODY_changed-skill_REV_2/);
-  assert.equal(calls("resources/read", uri("changed-skill")).length, 2, "Changed digest needs a new explicit load");
-  assert.equal(calls("resources/read").filter((event) => event.params.uri.endsWith("notes.txt")).length, 0, "Supporting resources must remain lazy");
+  assert.match(result("changed"), /FIXTURE_BODY_changed-skill_REV_2/);
+  assert.match(result("changedCached"), /FIXTURE_BODY_changed-skill_REV_2/);
+  assert.ok(calls("skills/get", uri("changed-skill")).length >= 1, "Changed bytes must automatically verify the new manifest");
+  assert.equal(calls("resources/read", uri("changed-skill")).length, 2, "Changed manifest must trigger one automatic re-fetch verified against the refreshed manifest");
+  assert.equal(wire[7].reads, wire[6].reads, "The automatically verified changed version must also be cached");
+  assert.match(result("local"), /NORMAL_LOCAL_FILE_READ_OK/);
+  assert.match(result("localSkill"), /NORMAL_LOCAL_SKILL_READ_OK/);
+  assert.equal(wire[9].reads, wire[7].reads, "Local files and local skills must not trigger remote file reads");
+  assert.equal(calls("resources/read").filter((event) => event.params.uri.endsWith("notes.txt")).length, 0, "Unrequested supporting resources must remain lazy");
 
   const livePids = new Set(calls("skills/list").concat(calls("skills/get"), calls("resources/read")).map((event) => event.pid));
   assert.equal(livePids.size, 1, "Extension must borrow one native MCP connection, not spawn another server");
@@ -247,6 +308,7 @@ try {
   }
   assert.equal(frames.filter((frame) => frame.type === 'agent_start').length, 1, 'Only the ordinary prompt starts an agent turn');
   assert.equal(frames.filter((frame) => frame.type === "extension_error").length, 0, "Extension must not emit runtime errors");
+  assert.equal(frames.filter((frame) => /extension_ui|confirm|approval/i.test(frame.type ?? "")).length, 0, "Reads must not request confirmation or extension UI");
   const closed = once(child, "close");
   child.stdin.end();
   const [code, signal] = await Promise.race([
