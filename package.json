@@ -1,0 +1,12 @@
+{
+  "name": "omp-mcp-skills",
+  "version": "0.1.0",
+  "description": "Discover, inspect and load MCP server skills in Oh My Pi",
+  "type": "module",
+  "license": "MIT",
+  "repository": {"type": "git", "url": "git+https://github.com/naitsabessalter-ctrl/omp-mcp-skills.git"},
+  "omp": {"extensions": ["./index.ts"]},
+  "files": ["index.ts", "src", "LICENSE", "README.md"],
+  "dependencies": {"yaml": "2.9.0"},
+  "keywords": ["omp-plugin", "mcp", "skills", "sep-2640"]
+}
