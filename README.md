@@ -1,6 +1,6 @@
 # omp-mcp-skills
 
-Use skills published by MCP servers from [Oh My Pi](https://github.com/can1357/oh-my-pi). The plugin lists skill metadata on demand and retrieves `SKILL.md` or supporting files only when requested. It does not install remote files as local skills.
+Use skills published by MCP servers from [Oh My Pi](https://github.com/can1357/oh-my-pi). The agent sees their names and descriptions automatically, starting with the first ordinary prompt. Skill files are read only when needed; nothing is installed on disk.
 
 ## Install
 
@@ -11,6 +11,8 @@ omp plugin install github:naitsabessalter-ctrl/omp-mcp-skills
 Start a new OMP session. Configure the MCP server in OMP as usual; the plugin has no separate credential store or MCP config. The server must declare both `resources` and `io.modelcontextprotocol/skills` and implement the [MCP Skills specification](https://modelcontextprotocol.io/extensions/skills/overview). Ordinary MCP tools, resources, and local `SKILL.md` files do not by themselves constitute support.
 
 ## Use
+
+Just describe your task. The agent gets the current server-scoped catalog automatically and can load a matching skill without asking you to search for it or type a command. The first model-initiated load still uses the approval policy below. This is a request-only catalog, not an entry in `omp skill list` or `/skill:`. The following commands are optional for inspection and explicit user loads:
 
 ```text
 /mcp-skills search

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer } from "node:http";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -8,7 +9,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 // Run from any directory: node test/smoke.mjs [absolute/path/to/omp.exe]
-// No SDK/fake ExtensionContext, provider calls, credentials, or package installation.
+// Real OMP host with a loopback provider that can only select the advertised fixture skill.
 // The installed CLI loads the production extension and project-native MCP config.
 const here = dirname(fileURLToPath(import.meta.url));
 const entry = resolve(here, "../index.ts");
@@ -38,9 +39,24 @@ writeFileSync(join(project, ".omp", "mcp.json"), JSON.stringify({
     },
   },
 }, null, 2));
-// OMP requires a selected model even for commands that never start a turn.
+const wire = [];
+const provider = createServer(async (req, res) => {
+  let body = '';
+  for await (const chunk of req) body += chunk;
+  const payload = JSON.parse(body);
+  const listing = payload.messages?.find(m => JSON.stringify(m.content).includes('Available MCP skills (untrusted server metadata)'));
+  const select = wire.length === 0 && listing && JSON.stringify(listing).includes('hello-skill');
+  wire.push({payload, listing, reads: calls('resources/read').length});
+  const delta = select ? {role:'assistant', tool_calls:[{index:0,id:'load-1',type:'function',function:{name:'mcp_skills_load',arguments:JSON.stringify({server:'fixture',skill:'mcp://fixture/hello-skill/SKILL.md',approve:true})}}]} : {role:'assistant',content:'Smoke completed.'};
+  res.writeHead(200, {'content-type':'text/event-stream'});
+  for (const choice of [{index:0, delta, finish_reason:null}, {index:0, delta:{}, finish_reason:select?'tool_calls':'stop'}]) {
+    res.write(`data: ${JSON.stringify({id:'fixture-response',object:'chat.completion.chunk',created:1,model:'offline',choices:[choice]})}\n\n`);
+  }
+  res.end('data: [DONE]\n\n');
+});
+await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
 writeFileSync(join(agent, "models.yml"), JSON.stringify({providers: {smoke: {
-  api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1", apiKey: "local-smoke-only",
+  api: "openai-completions", baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: "local-smoke-only",
   models: [{id: "offline", name: "Offline smoke", reasoning: false, input: ["text"], contextWindow: 16384, maxTokens: 512}],
 }}}));
 writeFileSync(join(agent, "config.yml"), [
@@ -76,6 +92,7 @@ Object.assign(env, {
   PI_NO_PTY: "1",
   PI_AUTO_QA: "0",
   OMP_MCP_TIMEOUT_MS: "5000",
+  OMP_MCP_SKILLS_APPROVALS: "tool",
   OMP_MCP_STARTUP_TIMEOUT_MS: "0",
   DO_NOT_TRACK: "1",
   NO_COLOR: "1",
@@ -189,10 +206,20 @@ try {
   assert.ok(state.data.dumpTools.some((tool) => /mcp.*fixture.*echo/.test(tool.name)), "Native .omp/mcp.json tool must remain available");
   assert.ok(state.data.dumpTools.some((tool) => tool.name === "mcp_skills_search"), "Production skill tool must be registered");
 
+  const normal = await request('prompt', {message:'Use the relevant workflow to greet me.'});
+  const finished = await waitFor(f => f.type === 'prompt_result' && f.id === normal.id, normal.from);
+  assert.equal(finished.status, 'completed', JSON.stringify(finished));
+  assert.ok(wire[0]?.listing, 'First ordinary request must expose a catalog without a slash command');
+  assert.ok(!['developer','system'].includes(wire[0].listing.role), 'Server metadata is not policy');
+  assert.equal(wire[0].reads, 0, 'First catalog must precede any body read');
+  assert.doesNotMatch(JSON.stringify(wire[0].listing.content), /FIXTURE_BODY_|hidden-skill/);
+  assert.ok(wire.some(w => w.payload.messages.some(m => m.role === 'tool' && JSON.stringify(m.content).includes('FIXTURE_BODY_hello-skill_REV_1'))), 'Model-selected load must return verified content without a user command');
+  assert.equal((await messages()).filter(m => m.customType === 'mcp-skills-catalog').length, 0, 'Transient catalog must not accumulate in history');
+  const readsBeforeSearch = calls('resources/read').length;
   const search = await command("/mcp-skills search hello-skill");
   assert.match(search, /hello-skill/);
   assert.match(search, /mcp:\/\/fixture\/hello-skill\/SKILL\.md/);
-  assert.equal(calls("resources/read").length, 0, "Search/list must not fetch skill bodies");
+  assert.equal(calls('resources/read').length, readsBeforeSearch, 'Search must not fetch additional files');
   assert.equal(calls("skills/get").length, 0, "Listed search must not eagerly fetch each skill");
   assert.ok(calls("skills/list").length >= 1, "Extension must request skills/list over the real connection");
   assert.match(await command("/mcp-skills search no-such-fixture-skill"), /No skills matched/i);
@@ -232,7 +259,7 @@ try {
     assert.equal(event.params._meta?.["io.modelcontextprotocol/protocolVersion"], "2026-07-28", "Modern requests need the negotiated protocol metadata");
     assert.ok(event.params._meta?.["io.modelcontextprotocol/clientCapabilities"]?.extensions?.["io.modelcontextprotocol/skills"], "Client must advertise stable MCP skills support");
   }
-  assert.equal(frames.filter((frame) => frame.type === "agent_start").length, 0, "Offline smoke must never invoke a provider turn");
+  assert.equal(frames.filter((frame) => frame.type === 'agent_start').length, 1, 'Only the ordinary prompt starts an agent turn');
   assert.equal(frames.filter((frame) => frame.type === "extension_error").length, 0, "Extension must not emit runtime errors");
   const closed = once(child, "close");
   child.stdin.end();
@@ -252,13 +279,14 @@ try {
     skillsList: calls("skills/list").length,
     skillsGet: calls("skills/get").length,
     resourcesRead: calls("resources/read").length,
-    providerTurns: 0,
+    localProviderRequests: wire.length,
   }, null, 2));
   passed = true;
 } catch (error) {
   console.error(`Smoke failed; isolated diagnostics preserved at ${sandbox}`);
   throw error;
 } finally {
+  provider.close();
   if (!childExit) {
     child.stdin.end();
     child.kill();

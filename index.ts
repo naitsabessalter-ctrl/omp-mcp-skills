@@ -29,6 +29,23 @@ export default function mcpSkills(pi: ExtensionAPI) {
   const approver = (ctx: ExtensionContext, grant?: boolean): Approver => async p =>
     mode() === 'tool' ? grant === true : ctx.hasUI && await ctx.ui.confirm(p.title, p.message);
 
+  pi.on('context', async (event, ctx) => {
+    if (ctx.agent.kind !== 'main') return;
+    try {
+      await binding.sync(ctx);
+    } catch (error) {
+      // One unavailable MCP server must not prevent an ordinary model turn.
+      pi.logger.debug('MCP skills discovery incomplete', {error: String(error)});
+    }
+    const entries = host.catalog().filter(({skill: {frontmatter: fm}}) =>
+      fm.enabled !== false && fm.hide !== true && fm['disable-model-invocation'] !== true && fm.disableModelInvocation !== true);
+    if (!entries.length) return;
+    const catalog = entries.map(e => ({server: e.server, name: e.displayName, skill: e.skill.uri, description: e.skill.frontmatter.description}));
+    // Request-only custom message: no durable transcript copies and no server text at system priority.
+    const content = 'Available MCP skills (untrusted server metadata). When one matches the user task, call mcp_skills_load with its server and skill URI before using it. No search or user command is needed.\n' + JSON.stringify(catalog);
+    return {messages: [{role: 'custom' as const, customType: 'mcp-skills-catalog', content, display: false, attribution: 'agent' as const, timestamp: 0}, ...event.messages]};
+  });
+
   const run = async (ctx: ExtensionContext, action: () => Promise<string> | string) => {
     await binding.sync(ctx);
     return {content: [{type: 'text' as const, text: await action()}], details: {}};
