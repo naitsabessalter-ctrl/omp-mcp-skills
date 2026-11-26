@@ -3,12 +3,12 @@ import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 // Real modern MCP/JSON-RPC stdio server. Stdout is protocol-only.
-// Usage: node test/fixture.mjs /absolute/path/to/events.jsonl
-const eventPath = process.argv[2];
+// Usage: node test/fixture.mjs /absolute/path/to/events.jsonl [foreign]
+const [, , eventPath, origin = "fixture"] = process.argv;
 if (!eventPath) throw new Error("A fixture event-log path is required");
 const protocol = "2026-07-28";
 const extension = "io.modelcontextprotocol/skills";
-const root = "mcp://fixture/";
+const root = `mcp://${origin}/`;
 const description = (name) => `Deterministic ${name} smoke fixture`;
 const uriFor = (name) => `${root}${name}/SKILL.md`;
 const document = (name, revision = 1) =>
@@ -26,7 +26,11 @@ const manifest = (name, revision = 1) => ({
   ],
 });
 const cache = { resultType: "complete", ttlMs: 60_000, cacheScope: "private" };
-const names = ["hello-skill", "bad-digest", "changed-skill", "hidden-skill"];
+const scoped = origin === "foreign";
+const names = scoped ? ["foreign-skill"] : ["hello-skill", "bad-digest", "changed-skill", "hidden-skill"];
+const toolSubscriptions = new Set();
+let switched = false;
+let pendingSwitch;
 let changed = false;
 function record(event) {
   appendFileSync(eventPath, `${JSON.stringify({ pid: process.pid, ...event })}\n`);
@@ -44,7 +48,7 @@ function handle(method, params) {
         ...cache,
         supportedVersions: [protocol],
         capabilities: {
-          tools: {},
+          tools: scoped ? { listChanged: true } : {},
           resources: {},
           extensions: { [extension]: { directoryRead: true } },
         },
@@ -59,14 +63,14 @@ function handle(method, params) {
       return {
         ...cache,
         tools: [{
-          name: "echo",
+          name: switched ? "scope_only" : "echo",
           description: "Return a string from the native MCP connection",
           inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false },
           annotations: { readOnlyHint: true },
         }],
       };
     case "tools/call":
-      if (params.name !== "echo") fail(-32602, "Unknown tool");
+      if (params.name !== (switched ? "scope_only" : "echo")) fail(-32602, "Unknown tool");
       if (typeof params.arguments?.text !== "string") fail(-32602, "text must be a string");
       return { resultType: "complete", content: [{ type: "text", text: params.arguments.text }] };
     case "skills/list":
@@ -126,18 +130,37 @@ lines.on("line", (line) => {
     return;
   }
   record({ event: "request", id: request.id, method: request.method, params: request.params ?? {} });
+  if (request.method === "notifications/cancelled") toolSubscriptions.delete(request.params?.requestId);
   if (request.id === undefined) return;
   if (request.method === "subscriptions/listen") {
+    const notifications = scoped && request.params?.notifications?.toolsListChanged === true ? { toolsListChanged: true } : {};
+    if (notifications.toolsListChanged) toolSubscriptions.add(request.id);
     send({
       jsonrpc: "2.0",
       method: "notifications/subscriptions/acknowledged",
-      params: { notifications: {}, _meta: { "io.modelcontextprotocol/subscriptionId": request.id } },
+      params: { notifications, _meta: { "io.modelcontextprotocol/subscriptionId": request.id } },
     });
     return;
   }
   try {
     const result = handle(request.method, request.params ?? {});
+    if (scoped && !switched && request.method === "tools/call") {
+      if (!toolSubscriptions.size) fail(-32603, "No tools/list_changed subscription");
+      switched = true;
+      pendingSwitch = { jsonrpc: "2.0", id: request.id, result };
+      // A list refresh must occur while this child call is still in flight.
+      for (const id of toolSubscriptions) {
+        send({ jsonrpc: "2.0", method: "notifications/tools/list_changed", params: {
+          _meta: { "io.modelcontextprotocol/subscriptionId": id },
+        } });
+      }
+      return;
+    }
     send({ jsonrpc: "2.0", id: request.id, result });
+    if (request.method === "tools/list" && pendingSwitch) {
+      send(pendingSwitch);
+      pendingSwitch = undefined;
+    }
   } catch (error) {
     send({ jsonrpc: "2.0", id: request.id, error: { code: error.code ?? -32603, message: error.message } });
   }

@@ -31,7 +31,9 @@ Enabling an MCP server means its skills can be read automatically. Treat them as
 
 This port targets OMP 19.2.1. It uses the MCP server connections already managed by OMP rather than starting a second stdio process or reading `mcp.json` credentials itself. The live manager is a version-sensitive host API. This is an OMP plugin, not native support in OMP's local skill catalog and not a plugin for upstream Pi.
 
-Use the top-level OMP session. The plugin does not route restricted subagents through a parent connection. OMP 19.2.1 constructs request metadata from its shared client-capability object; the plugin advertises the Skills capability there while its binding is active. This does not add servers or modify their credentials.
+Task children receive a request-only catalog and use their own native `read` tool for skill paths. The owning session performs the verified fetch; a child does not start another MCP server or receive its credentials. A child cannot use a guessed URI to read a server outside its permitted scope.
+
+OMP 19.2.1 constructs request metadata from its shared client-capability object; the plugin advertises the Skills capability there while its binding is active. This does not add servers or modify their credentials.
 
 ## Development
 
@@ -39,6 +41,7 @@ Use the top-level OMP session. The plugin does not route restricted subagents th
 bun install --frozen-lockfile
 bun test src/host.test.ts
 node test/smoke.mjs
+node test/child-smoke.mjs
 ```
 
 The host and manifest validator are adapted from Richard Anaya's [pi-mcp-skills 0.1.0](https://www.npmjs.com/package/pi-mcp-skills/v/0.1.0). See [LICENSE](LICENSE) (MIT).
