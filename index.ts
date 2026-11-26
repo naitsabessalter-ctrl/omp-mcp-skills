@@ -70,22 +70,6 @@ export default function mcpSkills(pi: ExtensionAPI) {
       return {content: [{type: 'text' as const, text: 'Execution approved for this session.'}], details: {}};
     }});
 
-  pi.registerCommand('mcp-skills', {description: 'search [text] | load <server> <skill name or URI>', async handler(args, ctx) {
-    let text: string;
-    try {
-      await binding.sync(ctx);
-      const input = args.trim();
-      if (!input || /^search(?:\s|$)/.test(input)) text = search(host, input.slice(6).trim());
-      else {
-        // A skill name or URI has no spaces; configured server labels may have them.
-        const match = /^load\s+(.+?)\s+(\S+)$/.exec(input);
-        if (!match) throw new SkillsFailure('Usage: /mcp-skills search [text] | load <server> <skill name or URI>');
-        const [, origin, ref] = match;
-        text = (await host.load(origin, ref, p => p.kind === 'load' && p.server === origin || (ctx.hasUI && ctx.ui.confirm(p.title, p.message)))).text;
-      }
-    } catch (err) { text = `MCP Skills: ${err instanceof Error ? err.message : String(err)}`; }
-    pi.sendMessage({customType: 'mcp-skills', content: text, display: true, attribution: 'agent'}, {triggerTurn: false});
-  }});
   pi.on('tool_call', async (event, ctx) => {
     if (!isCodeExecutionTool(event.toolName) || !host.acting().length) return;
     const allowed = mode() === 'tool' ? execApproved : ctx.hasUI && await ctx.ui.confirm(`Run ${event.toolName}?`, `An untrusted MCP skill is loaded from ${host.acting().map(a => a.server).join(', ')}. It cannot grant code execution.`);

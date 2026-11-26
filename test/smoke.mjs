@@ -40,16 +40,25 @@ writeFileSync(join(project, ".omp", "mcp.json"), JSON.stringify({
   },
 }, null, 2));
 const wire = [];
+const steps = [
+  ['load', {skill:'hello-skill'}],
+  ['search', {query:'no-such-fixture-skill'}],
+  ['load', {skill:'hello-skill'}],
+  ['load', {skill:'mcp://fixture/hidden-skill/SKILL.md'}],
+  ['load', {skill:'bad-digest'}],
+  ['load', {skill:'changed-skill'}],
+  ['load', {skill:'changed-skill'}],
+];
 const provider = createServer(async (req, res) => {
   let body = '';
   for await (const chunk of req) body += chunk;
   const payload = JSON.parse(body);
   const listing = payload.messages?.find(m => JSON.stringify(m.content).includes('Available MCP skills (untrusted server metadata)'));
-  const select = wire.length === 0 && listing && JSON.stringify(listing).includes('hello-skill');
+  const step = listing && JSON.stringify(listing).includes('hello-skill') && steps[wire.length];
   wire.push({payload, listing, reads: calls('resources/read').length});
-  const delta = select ? {role:'assistant', tool_calls:[{index:0,id:'load-1',type:'function',function:{name:'mcp_skills_load',arguments:JSON.stringify({server:'fixture',skill:'mcp://fixture/hello-skill/SKILL.md',approve:true})}}]} : {role:'assistant',content:'Smoke completed.'};
+  const delta = step ? {role:'assistant', tool_calls:[{index:0,id:`step-${wire.length}`,type:'function',function:{name:`mcp_skills_${step[0]}`,arguments:JSON.stringify({server:'fixture', ...(step[0] === 'load' ? {approve:true} : {}), ...step[1]})}}]} : {role:'assistant',content:'Smoke completed.'};
   res.writeHead(200, {'content-type':'text/event-stream'});
-  for (const choice of [{index:0, delta, finish_reason:null}, {index:0, delta:{}, finish_reason:select?'tool_calls':'stop'}]) {
+  for (const choice of [{index:0, delta, finish_reason:null}, {index:0, delta:{}, finish_reason:step?'tool_calls':'stop'}]) {
     res.write(`data: ${JSON.stringify({id:'fixture-response',object:'chat.completion.chunk',created:1,model:'offline',choices:[choice]})}\n\n`);
   }
   res.end('data: [DONE]\n\n');
@@ -177,19 +186,6 @@ async function messages() {
   assert.ok(Array.isArray(response.data?.messages), "get_messages must return data.messages");
   return response.data.messages;
 }
-async function command(text) {
-  const before = (await messages()).filter((message) => message.customType === "mcp-skills").length;
-  const { id, from, response } = await request("prompt", { message: text });
-  if (response.data?.agentInvoked !== false) {
-    const result = await waitFor((frame) => frame.type === "prompt_result" && frame.id === id, from);
-    assert.equal(result.agentInvoked, false, "Slash command must not start a model turn");
-    assert.equal(result.status, "completed", JSON.stringify(result));
-  }
-  const output = (await messages()).filter((message) => message.customType === "mcp-skills");
-  assert.equal(output.length, before + 1, `Expected exactly one mcp-skills result for ${text}`);
-  assert.equal(output.at(-1).display, true, "User-command result must be visible");
-  return contentText(output.at(-1).content);
-}
 function events() {
   return readFileSync(eventsPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
@@ -201,7 +197,7 @@ let passed = false;
 try {
   await waitFor((frame) => frame.type === "ready");
   const available = await request("get_available_commands");
-  assert.ok(available.response.data.commands.some((item) => item.name === "mcp-skills"), "Production /mcp-skills command must be loaded");
+  assert.equal(available.response.data.commands.some(item => item.name === 'mcp-skills'), false, 'Plugin must not expose a slash command');
   const { response: state } = await request("get_state");
   assert.ok(state.data.dumpTools.some((tool) => /mcp.*fixture.*echo/.test(tool.name)), "Native .omp/mcp.json tool must remain available");
   assert.ok(state.data.dumpTools.some((tool) => tool.name === "mcp_skills_search"), "Production skill tool must be registered");
@@ -215,36 +211,26 @@ try {
   assert.doesNotMatch(JSON.stringify(wire[0].listing.content), /FIXTURE_BODY_|hidden-skill/);
   assert.ok(wire.some(w => w.payload.messages.some(m => m.role === 'tool' && JSON.stringify(m.content).includes('FIXTURE_BODY_hello-skill_REV_1'))), 'Model-selected load must return verified content without a user command');
   assert.equal((await messages()).filter(m => m.customType === 'mcp-skills-catalog').length, 0, 'Transient catalog must not accumulate in history');
-  const readsBeforeSearch = calls('resources/read').length;
-  const search = await command("/mcp-skills search hello-skill");
-  assert.match(search, /hello-skill/);
-  assert.match(search, /mcp:\/\/fixture\/hello-skill\/SKILL\.md/);
-  assert.equal(calls('resources/read').length, readsBeforeSearch, 'Search must not fetch additional files');
-  assert.equal(calls("skills/get").length, 0, "Listed search must not eagerly fetch each skill");
-  assert.ok(calls("skills/list").length >= 1, "Extension must request skills/list over the real connection");
-  assert.match(await command("/mcp-skills search no-such-fixture-skill"), /No skills matched/i);
-
-  const hello = await command("/mcp-skills load fixture hello-skill");
+  const results = wire.at(-1).payload.messages.filter(m => m.role === 'tool').map(m => contentText(m.content));
+  assert.equal(results.length, steps.length);
+  const [hello, search, cached, hidden, denied, changed, changedApproved] = results;
   assert.match(hello, /FIXTURE_BODY_hello-skill_REV_1/);
   assert.match(hello, /fixture/);
-  assert.equal(calls("resources/read", uri("hello-skill")).length, 1);
-  const helloAgain = await command("/mcp-skills load fixture hello-skill");
-  assert.match(helloAgain, /FIXTURE_BODY_hello-skill_REV_1/);
+  assert.match(search, /No skills matched/i);
+  assert.equal(wire[2].reads, wire[1].reads, 'Search must not fetch files');
+  assert.match(cached, /FIXTURE_BODY_hello-skill_REV_1/);
+  assert.ok(calls('skills/list').length >= 1);
   assert.equal(calls("resources/read", uri("hello-skill")).length, 1, "Identical digest should reuse verified in-memory bytes");
 
-  const hidden = await command(`/mcp-skills load fixture ${uri("hidden-skill")}`);
   assert.match(hidden, /FIXTURE_BODY_hidden-skill_REV_1/);
   assert.equal(calls("skills/get", uri("hidden-skill")).length, 1, "URI omitted from skills/list must use skills/get");
 
-  const denied = await command("/mcp-skills load fixture bad-digest");
   assert.match(denied, /does not match the digest or size/i);
   assert.doesNotMatch(denied, /TAMPERED_BYTES_MUST_NEVER_BE_PRESENTED/);
   assert.equal(calls("skills/get", uri("bad-digest")).length, 1, "Digest mismatch must revalidate the manifest");
 
-  const changed = await command("/mcp-skills load fixture changed-skill");
   assert.match(changed, /no longer matches the approved skill/i);
   assert.doesNotMatch(changed, /FIXTURE_BODY_changed-skill_REV_2/);
-  const changedApproved = await command("/mcp-skills load fixture changed-skill");
   assert.match(changedApproved, /FIXTURE_BODY_changed-skill_REV_2/);
   assert.equal(calls("resources/read", uri("changed-skill")).length, 2, "Changed digest needs a new explicit load");
   assert.equal(calls("resources/read").filter((event) => event.params.uri.endsWith("notes.txt")).length, 0, "Supporting resources must remain lazy");

@@ -12,15 +12,7 @@ Start a new OMP session. Configure the MCP server in OMP as usual; the plugin ha
 
 ## Use
 
-Just describe your task. The agent gets the current server-scoped catalog automatically and can load a matching skill without asking you to search for it or type a command. The first model-initiated load still uses the approval policy below. This is a request-only catalog, not an entry in `omp skill list` or `/skill:`. The following commands are optional for inspection and explicit user loads:
-
-```text
-/mcp-skills search
-/mcp-skills search review
-/mcp-skills load my-server skill://code-review/SKILL.md
-```
-
-Replace `my-server` and the URI with a result from your server. A direct user `load` command authorizes that skill; search and load do not invoke an LLM. The agent can instead call `mcp_skills_search`, `mcp_skills_load`, `mcp_skills_read`, and `mcp_skills_directory`. Loading by URI also works when `skills/list` omits the entry. Resource reads by themselves do not activate a skill.
+Describe your task normally. The agent sees the server-scoped catalog from its first prompt and can load a matching skill on demand. The plugin registers no slash commands. Remote skills are not installed in `omp skill list` or `/skill:`. The agent can also load an unlisted skill if given its URI. Reading a supporting file does not activate a skill.
 
 **Approvals.** Model-initiated loads require interactive confirmation by default. With no UI the default is to refuse them. For explicitly trusted unattended automation, `OMP_MCP_SKILLS_APPROVALS=tool` accepts `approve: true` from a tool call instead of asking the user. This trusts the caller, including a model, and is **not** human approval. In that mode `mcp_skills_allow_exec` grants execution for the session. In UI mode an active skill causes an additional confirmation for `bash`, `shell`, `exec`, `python`, and `eval`. This is not a sandbox for arbitrary third-party tools. Remote `allowed-tools` does not grant permissions.
 
