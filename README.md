@@ -10,6 +10,17 @@ omp plugin install github:naitsabessalter-ctrl/omp-mcp-skills
 
 Start a new OMP session. Configure the MCP server in OMP as usual; the plugin has no separate credential store or MCP config. The server must declare both `resources` and `io.modelcontextprotocol/skills` and implement the [MCP Skills specification](https://modelcontextprotocol.io/extensions/skills/overview). Ordinary MCP tools, resources, and local `SKILL.md` files do not by themselves constitute support.
 
+### Update
+
+On each machine where the plugin is already installed, run:
+
+```sh
+omp plugin upgrade omp-mcp-skills
+omp plugin list
+```
+
+Check the installed version in the list, then restart OMP to load it. Restarting alone does not download an update. If the plugin is not listed, use the install command above.
+
 ## Use
 
 Describe your task normally. OMP sees the server catalog before the model answers and uses its **built-in `read` tool** for the skill and its supporting files. The plugin registers a read-only `mcp-skill://` URI scheme, not a model tool or slash command. No skill loader, approval flag or plugin confirmation dialog is involved. Local `skill://` resolution stays unchanged.
