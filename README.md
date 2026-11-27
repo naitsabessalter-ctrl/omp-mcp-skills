@@ -23,7 +23,7 @@ Check the installed version in the list, then restart OMP to load it. Restarting
 
 ## Use
 
-Describe your task normally. OMP sees the server catalog before the model answers and uses its **built-in `read` tool** for the skill and its supporting files. The plugin registers a read-only `mcp-skill://` URI scheme, not a model tool or slash command. No skill loader, approval flag or plugin confirmation dialog is involved. Local `skill://` resolution stays unchanged.
+Describe your task normally. OMP shows the remote catalog before the model answers. The built-in `read` tool accepts the advertised `mcp-skill://` path or, for a uniquely named remote entry, `skill://<name>` and `skill://<name>/<relative-file>`. A loaded local skill keeps its name, including for missing files. If multiple servers publish the same name, use the explicit catalog path. The alias applies only to `read`; it does not install files or add a slash command.
 
 Enabling an MCP server means its skills can be read automatically. Treat them as third-party instructions, even when integrity checks pass. Manifest-backed files are checked against the listed byte length and SHA-256 digest; dynamic skills have no content digest. The plugin does not execute skill files, grant shell access, change OMP's own tool approvals or persist the remote skills as installed files.
 

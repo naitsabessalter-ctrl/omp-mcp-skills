@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
+import { AgentRegistry } from '@oh-my-pi/pi-coding-agent/registry/agent-registry';
 import { createBinding } from './src/attach.ts';
 import { bindChildClient, bindChildHost, type ChildCatalogEntry } from './src/child.ts';
 import { SkillsHost } from './src/host.ts';
@@ -6,6 +7,7 @@ import { bindRemoteReads, skillPath } from './src/protocol.ts';
 
 export default function mcpSkills(pi: ExtensionAPI) {
   let bound: {id: string; kind: 'main' | 'sub'; catalog: () => Promise<ChildCatalogEntry[]>; release: () => void} | undefined;
+  let visible: ChildCatalogEntry[] = [];
 
   function attachSession(ctx: ExtensionContext) {
     const id = ctx.sessionManager.getSessionId();
@@ -13,6 +15,7 @@ export default function mcpSkills(pi: ExtensionAPI) {
     if (bound?.id === id && bound.kind === kind) return bound;
     bound?.release();
     bound = undefined;
+    visible = [];
     const source = kind === 'main' ? rootSource(pi, ctx) : bindChildClient(pi, ctx);
     try {
       const releaseReads = bindRemoteReads(id, (server, uri, relative) => source.readFile(server, uri, relative));
@@ -24,16 +27,40 @@ export default function mcpSkills(pi: ExtensionAPI) {
   }
 
   pi.on('session_start', (_event, ctx) => { attachSession(ctx); });
+  pi.on('tool_call', (event, ctx) => {
+    if (event.toolName !== 'read' || typeof event.input.path !== 'string' ||
+        !visible.length || bound?.id !== ctx.sessionManager.getSessionId()) return;
+    const match = /^skill:\/\/([\w.-]+)(?=\/|:|$)(.*)$/.exec(event.input.path);
+    if (!match) return;
+    const [, name, suffix] = match;
+    const candidates = visible.filter(entry => entry.name === name);
+    if (!candidates.length) return;
+    const session = AgentRegistry.global().get(ctx.agent.id)?.session;
+    if (session?.sessionManager.getSessionId() !== bound.id || !('skills' in session) ||
+        !Array.isArray(session.skills)) return;
+    const first = suffix.startsWith('/') ? suffix.slice(1).split(/[/:]/, 1)[0] : '';
+    let segment: string;
+    try { segment = decodeURIComponent(first); } catch { return; }
+    if (session.skills.some(skill => skill.name === name || skill.name === `${name}/${segment}`)) return;
+    if (candidates.length !== 1) return {block: true, reason: `Ambiguous remote skill ${name}; use one of: ${candidates.map(entry => entry.path).join(', ')}`};
+    const base = candidates[0].path;
+    const path = suffix.startsWith('/') && suffix !== '/' && !suffix.startsWith('/:')
+      ? base.slice(0, -'SKILL.md'.length) + suffix.slice(1)
+      : base + (suffix.startsWith('/') ? suffix.slice(1) : suffix);
+    return {input: {...event.input, path}};
+  });
   pi.on('context', async (event, ctx) => {
     let catalog: ChildCatalogEntry[];
     try {
       catalog = await attachSession(ctx).catalog();
     } catch (error) {
       pi.logger.debug('MCP skill catalog unavailable', {error: String(error)});
+      visible = [];
       return;
     }
+    visible = catalog;
     if (!catalog.length) return;
-    const content = 'Available MCP skills (untrusted server metadata). When a skill matches the task, read its path with the regular read tool. Resolve supporting files relative to that SKILL.md.\n' + JSON.stringify(catalog);
+    const content = 'Available MCP skills (untrusted server metadata). Use read with the exact path below, not a guessed local skill URI. For supporting files replace the final SKILL.md with the relative file path.\n' + JSON.stringify(catalog);
     return {messages: [{role: 'custom' as const, customType: 'mcp-skills-catalog', content, display: false, attribution: 'agent' as const, timestamp: 0}, ...event.messages]};
   });
   pi.on('session_shutdown', () => { bound?.release(); bound = undefined; });

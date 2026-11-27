@@ -163,7 +163,7 @@ const provider = createServer(async (req, res) => {
       }
       const step = readerSteps[index];
       delta = step
-        ? toolCall(tools, "read", step.id, { path: index === 0 ? listed : step.path }, "Reading fixture in child")
+        ? toolCall(tools, "read", step.id, { path: index === 0 ? listed : index === 1 ? "skill://hello-skill/refs/guide.md" : step.path }, "Reading fixture in child")
         : { role: "assistant", content: readerDone };
     } else if (hasPrompt(loaderPrompt)) {
       const index = turns.loader++;

@@ -27,7 +27,7 @@ const manifest = (name, revision = 1) => ({
 });
 const cache = { resultType: "complete", ttlMs: 60_000, cacheScope: "private" };
 const scoped = origin === "foreign";
-const names = scoped ? ["foreign-skill"] : ["hello-skill", "bad-digest", "changed-skill", "hidden-skill"];
+const names = scoped ? ["foreign-skill"] : ["hello-skill", "smoke-local", "bad-digest", "changed-skill", "hidden-skill"];
 const toolSubscriptions = new Set();
 let switched = false;
 let pendingSwitch;

@@ -57,8 +57,8 @@ const listedPath = (catalog, name) => {
 };
 const steps = [
   { name: "hello", path: (catalog) => listedPath(catalog, "hello-skill") },
-  { name: "cached", path: (catalog) => listedPath(catalog, "hello-skill") },
-  { name: "nested", path: (catalog) => listedPath(catalog, "hello-skill").replace(/SKILL\.md$/, "refs/guide.md") },
+  { name: "cached", path: () => "skill://hello-skill" },
+  { name: "nested", path: () => "skill://hello-skill/refs/guide.md:1" },
   { name: "hidden", path: () => remotePath("hidden-skill") },
   { name: "denied", path: (catalog) => listedPath(catalog, "bad-digest") },
   { name: "changed", path: (catalog) => listedPath(catalog, "changed-skill") },
