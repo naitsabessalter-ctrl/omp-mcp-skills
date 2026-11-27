@@ -27,12 +27,15 @@ export default function mcpSkills(pi: ExtensionAPI) {
   }
 
   pi.on('session_start', (_event, ctx) => { attachSession(ctx); });
-  pi.on('tool_call', (event, ctx) => {
+  pi.on('tool_call', async (event, ctx) => {
     if (event.toolName !== 'read' || typeof event.input.path !== 'string' ||
         !visible.length || bound?.id !== ctx.sessionManager.getSessionId()) return;
-    const match = /^skill:\/\/([\w.-]+)(?=\/|:|$)(.*)$/.exec(event.input.path);
+    const match = /^skill:\/\/([^/?:#]+)(?=\/|:|$)(.*)$/u.exec(event.input.path);
     if (!match) return;
-    const [, name, suffix] = match;
+    const [, encodedName, suffix] = match;
+    let name: string;
+    try { name = decodeURIComponent(encodedName); } catch { return; }
+    if (/[/:?#\\]/u.test(name)) return;
     const candidates = visible.filter(entry => entry.name === name);
     if (!candidates.length) return;
     const session = AgentRegistry.global().get(ctx.agent.id)?.session;
@@ -41,7 +44,16 @@ export default function mcpSkills(pi: ExtensionAPI) {
     const first = suffix.startsWith('/') ? suffix.slice(1).split(/[/:]/, 1)[0] : '';
     let segment: string;
     try { segment = decodeURIComponent(first); } catch { return; }
-    if (session.skills.some(skill => skill.name === name || skill.name === `${name}/${segment}`)) return;
+    const ownsName = (skill: {name: string}) => skill.name === name || skill.name === `${name}/${segment}`;
+    const localRead = encodedName === name ? undefined : {input: {...event.input, path: `skill://${name}${suffix}`}};
+    if (session.skills.some(ownsName)) return localRead;
+    // An alias miss can become a local hit between consecutive reads. OMP's ordinary
+    // unknown-name probe is throttled; refresh the registry only, not the prompt.
+    if (session.skillRediscoveryHost().refreshSkills) {
+      await session.reloadSkills();
+      if (AgentRegistry.global().get(ctx.agent.id)?.session !== session || bound?.id !== ctx.sessionManager.getSessionId()) return;
+      if (session.skills.some(ownsName)) return localRead;
+    }
     if (candidates.length !== 1) return {block: true, reason: `Ambiguous remote skill ${name}; use one of: ${candidates.map(entry => entry.path).join(', ')}`};
     const base = candidates[0].path;
     const path = suffix.startsWith('/') && suffix !== '/' && !suffix.startsWith('/:')

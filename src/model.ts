@@ -91,7 +91,7 @@ export function skillRoot(uri: string): string | undefined {
 export function skillNameFromUri(uri: string): string | undefined {
   const path = skillPath(uri);
   if (path === undefined) return undefined;
-  return path.slice(path.lastIndexOf("/") + 1);
+  return decodeURIComponent(path.slice(path.lastIndexOf("/") + 1));
 }
 
 export function validSkillName(name: string): boolean {

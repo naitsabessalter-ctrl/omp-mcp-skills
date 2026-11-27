@@ -10,9 +10,9 @@ const protocol = "2026-07-28";
 const extension = "io.modelcontextprotocol/skills";
 const root = `mcp://${origin}/`;
 const description = (name) => `Deterministic ${name} smoke fixture`;
-const uriFor = (name) => `${root}${name}/SKILL.md`;
+const uriFor = (name) => `${root}${encodeURIComponent(name)}/SKILL.md`;
 const document = (name, revision = 1) =>
-  `---\nname: ${name}\ndescription: ${description(name)}\n---\n\nFIXTURE_BODY_${name}_REV_${revision}\nSee [the nested reference](refs/guide.md).\n`;
+  `---\nname: ${name}\ndescription: ${description(name)}\n---\n\nFIXTURE_BODY_${name}_REV_${revision}\nOrigin: ${origin}\nSee [the nested reference](refs/guide.md).\n`;
 const reference = (name) => `NESTED_REFERENCE_${name}\n`;
 const digest = (text) => `sha256:${createHash("sha256").update(text).digest("hex")}`;
 const resource = (uri, text) => ({ uri, digest: digest(text), size: Buffer.byteLength(text) });
@@ -21,13 +21,13 @@ const manifest = (name, revision = 1) => ({
   frontmatter: { name, description: description(name) },
   resources: [
     resource(uriFor(name), document(name, revision)),
-    resource(`${root}${name}/notes.txt`, `Notes for ${name}\n`),
-    resource(`${root}${name}/refs/guide.md`, reference(name)),
+    resource(`${root}${encodeURIComponent(name)}/notes.txt`, `Notes for ${name}\n`),
+    resource(`${root}${encodeURIComponent(name)}/refs/guide.md`, reference(name)),
   ],
 });
 const cache = { resultType: "complete", ttlMs: 60_000, cacheScope: "private" };
 const scoped = origin === "foreign";
-const names = scoped ? ["foreign-skill"] : ["hello-skill", "smoke-local", "bad-digest", "changed-skill", "hidden-skill"];
+const names = scoped ? ["foreign-skill"] : origin === "second" ? ["common-review"] : ["hello-skill", "smoke-local", "bad-digest", "changed-skill", "hidden-skill", "common-review", "сборка", "late-install"];
 const toolSubscriptions = new Set();
 let switched = false;
 let pendingSwitch;
@@ -87,16 +87,16 @@ function handle(method, params) {
     case "prompts/list":
       return { ...cache, prompts: [] };
     case "resources/read": {
-      const name = names.find((candidate) => params.uri?.startsWith(`${root}${candidate}/`));
+      const name = names.find((candidate) => params.uri?.startsWith(`${root}${encodeURIComponent(candidate)}/`));
       if (!name) fail(-32602, "Unknown resource URI");
       let text;
       if (params.uri === uriFor(name)) {
         if (name === "changed-skill") changed = true;
         text = document(name, name === "changed-skill" && changed ? 2 : 1);
         if (name === "bad-digest") text += "TAMPERED_BYTES_MUST_NEVER_BE_PRESENTED\n";
-      } else if (params.uri === `${root}${name}/notes.txt`) {
+      } else if (params.uri === `${root}${encodeURIComponent(name)}/notes.txt`) {
         text = `Notes for ${name}\n`;
-      } else if (params.uri === `${root}${name}/refs/guide.md`) {
+      } else if (params.uri === `${root}${encodeURIComponent(name)}/refs/guide.md`) {
         text = reference(name);
       } else {
         fail(-32602, "Resource is not in the skill manifest");

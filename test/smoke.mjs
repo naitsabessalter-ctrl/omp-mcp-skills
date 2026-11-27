@@ -34,6 +34,7 @@ mkdirSync(localSkill, { recursive: true });
 writeFileSync(join(localSkill, "SKILL.md"), "---\nname: smoke-local\ndescription: Offline local skill smoke fixture\n---\n\nNORMAL_LOCAL_SKILL_READ_OK\n");
 writeFileSync(join(project, ".omp", "mcp.json"), JSON.stringify({
   mcpServers: {
+    second: { type: 'stdio', command: process.execPath, args: [join(here, 'fixture.mjs'), join(sandbox, 'second.jsonl'), 'second'], cwd: project },
     fixture: {
       type: "stdio",
       command: process.execPath,
@@ -65,6 +66,18 @@ const steps = [
   { name: "changedCached", path: (catalog) => listedPath(catalog, "changed-skill") },
   { name: "local", path: () => "ordinary.txt" },
   { name: "localSkill", path: () => "skill://smoke-local/SKILL.md" },
+  { name: 'unicode', path: () => 'skill://сборка' },
+  { name: 'encoded', path: () => `skill://${encodeURIComponent('сборка')}/refs/guide.md:1` },
+  { name: 'collision', path: () => 'skill://common-review' },
+  ...['fixture', 'second'].map(server => ({name: `explicit-${server}`, path: catalog => catalog.find(e => e.server === server && e.name === 'common-review').path})),
+  { name: 'beforeInstall', path: () => 'skill://late-install' },
+  { name: 'afterInstall', path: () => {
+    const folder = join(project, '.omp', 'skills', 'late-install');
+    mkdirSync(folder, {recursive: true});
+    writeFileSync(join(folder, 'SKILL.md'), '---\nname: late-install\ndescription: Installed after first read\n---\nLOCAL_AFTER_START\n');
+    return 'skill://late-install';
+  } },
+  { name: 'missingLocal', path: () => 'skill://late-install/refs/guide.md' },
 ];
 let providerError;
 const provider = createServer(async (req, res) => {
@@ -294,6 +307,20 @@ try {
   assert.match(result("local"), /NORMAL_LOCAL_FILE_READ_OK/);
   assert.match(result("localSkill"), /NORMAL_LOCAL_SKILL_READ_OK/);
   assert.equal(wire[9].reads, wire[7].reads, "Local files and local skills must not trigger remote file reads");
+  assert.match(result('unicode'), /FIXTURE_BODY_сборка/);
+  assert.match(result('encoded'), /NESTED_REFERENCE_сборка/);
+  const collision = result('collision');
+  assert.match(collision, /Ambiguous remote skill common-review/);
+  for (const server of ['fixture', 'second']) {
+    const path = wire[0].catalog.find(e => e.server === server && e.name === 'common-review').path;
+    assert.ok(collision.includes(path), `Ambiguity must identify ${server}`);
+    assert.match(result(`explicit-${server}`), new RegExp(`Origin: ${server}\\b`));
+  }
+  assert.doesNotMatch(collision, /FIXTURE_BODY/);
+  assert.match(result('beforeInstall'), /FIXTURE_BODY_late-install/);
+  assert.match(result('afterInstall'), /LOCAL_AFTER_START/);
+  assert.doesNotMatch(result('missingLocal'), /NESTED_REFERENCE/);
+  assert.equal(calls('resources/read', 'mcp://fixture/late-install/refs/guide.md').length, 0);
   assert.equal(calls("resources/read").filter((event) => event.params.uri.endsWith("notes.txt")).length, 0, "Unrequested supporting resources must remain lazy");
 
   const livePids = new Set(calls("skills/list").concat(calls("skills/get"), calls("resources/read")).map((event) => event.pid));
